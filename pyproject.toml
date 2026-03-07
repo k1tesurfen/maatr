@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maatr"
+version = "0.1.0"
+description = "Bring order to the chaos of media files."
+requires-python = ">=3.8"
+dependencies = [
+    "click",
+    "guessit"
+]
+
+[project.scripts]
+maatr = "maatr:cli"
+mtr = "maatr:cli"
