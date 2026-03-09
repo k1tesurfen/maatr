@@ -1,7 +1,7 @@
 <h1 align="center">
-  <img src="" alt="plug" width="500">
+  <img src="./maatr-logo.svg" alt="plug" width="500">
   <br>
-  maatr - File name cleaning for media files.
+  maatr - filename cleaning for media files
 </h1>
 
 ##
