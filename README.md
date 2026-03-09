@@ -57,6 +57,17 @@ If you made a mistake, you can revert the last organization run:
 maatr undo
 ```
 
-### Configuration
+### Init
+Create a default configuration file:
+```bash
+maatr init
+```
+- Use `--global` to create the config in `~/.config/maatr/maatr.toml` instead of the current directory.
 
-On the first run, Maatr creates a `maatr.toml` file in the current directory. You can edit this file to customize your naming templates and audio language mappings.
+### Configuration
+Maatr searches for a `maatr.toml` file in the following order:
+1. The current working directory.
+2. `~/.config/maatr/maatr.toml`.
+
+If no file is found, it uses its internal defaults. You can edit the config file to customize your naming templates and audio language mappings.
+

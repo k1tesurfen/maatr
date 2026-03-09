@@ -7,7 +7,9 @@ import click
 from guessit import guessit
 
 STATE_FILE = ".maatr_history.json"
-CONFIG_FILE = "maatr.toml"
+LOCAL_CONFIG = "maatr.toml"
+GLOBAL_CONFIG_DIR = os.path.expanduser("~/.config/maatr")
+GLOBAL_CONFIG_FILE = os.path.join(GLOBAL_CONFIG_DIR, "maatr.toml")
 
 DEFAULT_CONFIG = """
 [templates.movie]
@@ -41,14 +43,17 @@ en = "ENG"
 
 
 def load_config():
-    """Loads maatr.toml or creates it with defaults if missing."""
-    if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "w") as f:
-            f.write(DEFAULT_CONFIG.strip())
-        click.secho(f"Generated default config: {CONFIG_FILE}", fg="cyan")
+    """Loads config from local dir or global ~/.config/maatr/."""
+    if os.path.exists(LOCAL_CONFIG):
+        with open(LOCAL_CONFIG, "rb") as f:
+            return tomllib.load(f)
 
-    with open(CONFIG_FILE, "rb") as f:
-        return tomllib.load(f)
+    if os.path.exists(GLOBAL_CONFIG_FILE):
+        with open(GLOBAL_CONFIG_FILE, "rb") as f:
+            return tomllib.load(f)
+
+    # Fallback to default if no file exists (don't auto-create)
+    return tomllib.loads(DEFAULT_CONFIG)
 
 
 def load_state():
@@ -171,7 +176,27 @@ def cli():
 
 
 @cli.command()
+@click.option("--global", "is_global", is_flag=True, help="Create config in ~/.config/maatr/")
+def init(is_global):
+    """Initialize a default maatr.toml configuration file."""
+    target = GLOBAL_CONFIG_FILE if is_global else LOCAL_CONFIG
+
+    if os.path.exists(target):
+        if not click.confirm(f"{target} already exists. Overwrite?"):
+            return
+
+    if is_global:
+        os.makedirs(GLOBAL_CONFIG_DIR, exist_ok=True)
+
+    with open(target, "w") as f:
+        f.write(DEFAULT_CONFIG.strip())
+
+    click.secho(f"Created config: {target}", fg="green")
+
+
+@cli.command()
 @click.option("--dry-run", is_flag=True, help="Preview changes without moving files.")
+
 @click.option("--ask", is_flag=True, help="Ask for confirmation on unknown files.")
 def organize(dry_run, ask):
     """Organize media files in the current directory."""
