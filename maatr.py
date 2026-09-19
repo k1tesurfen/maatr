@@ -27,6 +27,15 @@ file = "{title} S{season_pad}E{episode_pad} [{resolution}] [{audio}]{ext}"
 enforce_first = "ENG"
 default_fallback = "ENG"
 
+# Audio track cleanup (mtr audio / mtr organize --audio).
+# When BOTH languages are present the file is reduced to one track each:
+# the preferred one at best quality (and flagged default), the secondary one
+# at smallest size. If only one of them is present, nothing is removed and
+# only the default flag is corrected.
+preferred = "eng"
+secondary = "ger"
+fallback_default = "ger"
+
 [audio.mapping]
 deu = "GER"
 ger = "GER"
@@ -127,6 +136,550 @@ def get_audio_languages(filepath, config):
         return fallback
 
 
+# --- Audio track cleanup -------------------------------------------------
+#
+# The goal is one preferred-language track (best quality, default flag) plus one
+# secondary-language track (smallest, kept only as a fallback). Everything else
+# goes. Dropping tracks means rewriting the file, so the rule only fires when
+# both languages are actually there; otherwise we settle for fixing the default
+# flag, which is an instant in-place edit.
+
+TEMP_SUFFIX = ".maatr-tmp.mkv"
+
+# ISO-639 is a mess: Matroska may carry 'ger', 'deu' or the IETF 'de-DE'.
+LANG_ALIASES = {
+    "deu": "ger",
+    "de": "ger",
+    "ger": "ger",
+    "eng": "eng",
+    "en": "eng",
+    "fra": "fre",
+    "fre": "fre",
+    "fr": "fre",
+    "ita": "ita",
+    "it": "ita",
+    "spa": "spa",
+    "es": "spa",
+    "por": "por",
+    "pt": "por",
+    "nld": "dut",
+    "dut": "dut",
+    "nl": "dut",
+}
+
+COMMENTARY_RE = re.compile(r"commentary|kommentar|audiokommentar", re.IGNORECASE)
+
+
+def normalize_lang(value):
+    """Folds a Matroska language tag down to one canonical 3-letter code."""
+    if not value:
+        return "und"
+    code = str(value).strip().lower().replace("_", "-")
+    if code in LANG_ALIASES:
+        return LANG_ALIASES[code]
+    # 'de-DE', 'en-GB' and friends: the part before the dash is the language.
+    base = code.split("-")[0]
+    if base in LANG_ALIASES:
+        return LANG_ALIASES[base]
+    return base[:3] if base else "und"
+
+
+def track_language(track):
+    """Prefers the IETF tag when present; it is the more precise of the two."""
+    props = track.get("properties", {})
+    ietf = props.get("language_ietf")
+    if ietf and ietf.lower() not in ("und", "mis", "zxx"):
+        return normalize_lang(ietf)
+    return normalize_lang(props.get("language"))
+
+
+def is_commentary(track):
+    """Best effort: the flag if it was set, otherwise the track name."""
+    props = track.get("properties", {})
+    if props.get("flag_commentary"):
+        return True
+    return bool(COMMENTARY_RE.search(props.get("track_name") or ""))
+
+
+def probe_tracks(path):
+    """Returns mkvmerge's view of the file, or None if it can't be read."""
+    try:
+        result = subprocess.run(
+            ["mkvmerge", "-J", path], capture_output=True, text=True, check=True
+        )
+        return json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+        return None
+
+
+def packet_sum(path, audio_index):
+    """Exact track size for files that carry no statistics tags.
+
+    Reads every packet header of one audio stream, so it is slower than the tag
+    lookup but gives the identical number.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                f"a:{audio_index}",
+                "-show_entries",
+                "packet=size",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+    total = 0
+    for line in result.stdout.splitlines():
+        line = line.strip().rstrip(",")
+        if line.isdigit():
+            total += int(line)
+    return total or None
+
+
+def track_size(track, path, audio_index):
+    """Bytes occupied by an audio track: statistics tag first, packets second."""
+    tagged = track.get("properties", {}).get("tag_number_of_bytes")
+    if tagged:
+        try:
+            return int(str(tagged).strip())
+        except ValueError:
+            pass
+    if path is None:
+        return None
+    return packet_sum(path, audio_index)
+
+
+def describe_track(track):
+    """One-line human description used in the approval plan."""
+    props = track.get("properties", {})
+    channels = props.get("audio_channels")
+    layout = {1: "1.0", 2: "2.0", 6: "5.1", 8: "7.1"}.get(channels, f"{channels}ch")
+    parts = [track_language(track), track.get("codec", "?"), layout]
+    if is_commentary(track):
+        parts.append("(commentary)")
+    name = props.get("track_name")
+    if name:
+        parts.append(f"'{name}'")
+    return " ".join(str(p) for p in parts)
+
+
+def human_size(num_bytes):
+    if num_bytes is None:
+        return "?"
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f}{unit}" if unit in ("B", "KB") else f"{value:.1f}{unit}"
+        value /= 1024
+
+
+def pick_track(tracks, largest):
+    """Deterministic best/worst pick, so repeat runs agree with each other."""
+
+    def rank(track):
+        props = track.get("properties", {})
+        return (
+            track["_size"],
+            props.get("audio_channels") or 0,
+            props.get("audio_sampling_frequency") or 0,
+        )
+
+    # Sort by id first so ties fall to the lowest track id either way.
+    ordered = sorted(tracks, key=lambda t: t["id"])
+    return max(ordered, key=rank) if largest else min(ordered, key=rank)
+
+
+def plan_audio(info, config, path=None):
+    """Decides what to do with one file's audio. Pure apart from size lookups.
+
+    Returns a dict with an 'action' of remux, flags, none or skip.
+    """
+    audio_cfg = config.get("audio", {})
+    preferred = normalize_lang(audio_cfg.get("preferred", "eng"))
+    secondary = normalize_lang(audio_cfg.get("secondary", "ger"))
+    fallback = normalize_lang(audio_cfg.get("fallback_default", "ger"))
+
+    tracks = info.get("tracks", [])
+    audio = [t for t in tracks if t.get("type") == "audio"]
+    subtitles = [t for t in tracks if t.get("type") == "subtitles"]
+
+    if not audio:
+        return {"action": "skip", "reason": "no audio tracks"}
+
+    for position, track in enumerate(audio):
+        track["_lang"] = track_language(track)
+        track["_index"] = position
+        track["_commentary"] = is_commentary(track)
+        # Tag lookup only: free, and enough to show sizes even when we end up
+        # not needing them to choose. The costly fallback comes later.
+        track["_size"] = track_size(track, None, position)
+
+    by_lang = {}
+    for track in audio:
+        by_lang.setdefault(track["_lang"], []).append(track)
+
+    has_preferred = preferred in by_lang
+    has_secondary = secondary in by_lang
+
+    # The full rule needs both languages present; anything else is a flag fix.
+    if not (has_preferred and has_secondary):
+        target_lang = preferred if has_preferred else fallback
+        candidates = by_lang.get(target_lang)
+        if not candidates:
+            return {"action": "none", "audio": audio, "reason": "no track to promote"}
+        wanted = sorted(candidates, key=lambda t: t["id"])[0]
+        already = wanted["properties"].get("default_track") and not any(
+            t["properties"].get("default_track") for t in audio if t["id"] != wanted["id"]
+        )
+        if already:
+            return {"action": "none", "audio": audio, "reason": "default already correct"}
+        return {
+            "action": "flags",
+            "audio": audio,
+            "subtitles": subtitles,
+            "default_id": wanted["id"],
+            "keep": audio,
+            "drop": [],
+        }
+
+    # Both languages present: reduce to exactly one of each.
+    for track in audio:
+        if track["_size"] is None:
+            track["_size"] = track_size(track, path, track["_index"])
+
+    if any(t["_size"] is None for t in audio):
+        return {"action": "skip", "reason": "could not determine audio track sizes"}
+
+    def choose(lang, largest):
+        pool = [t for t in by_lang[lang] if not t["_commentary"]]
+        if not pool:  # every track of this language is commentary; take them all
+            pool = by_lang[lang]
+        return pick_track(pool, largest)
+
+    keep_preferred = choose(preferred, largest=True)
+    keep_secondary = choose(secondary, largest=False)
+    keep_ids = {keep_preferred["id"], keep_secondary["id"]}
+    keep = [t for t in audio if t["id"] in keep_ids]
+    drop = [t for t in audio if t["id"] not in keep_ids]
+
+    subtitle_default = any(t["properties"].get("default_track") for t in subtitles)
+    default_wrong = not keep_preferred["properties"].get("default_track") or any(
+        t["properties"].get("default_track")
+        for t in audio
+        if t["id"] != keep_preferred["id"]
+    )
+
+    if not drop:
+        if not default_wrong and not subtitle_default:
+            return {"action": "none", "audio": audio, "reason": "already clean"}
+        # Nothing to remove, so a flag edit is enough.
+        return {
+            "action": "flags",
+            "audio": audio,
+            "subtitles": subtitles,
+            "default_id": keep_preferred["id"],
+            "keep": keep,
+            "drop": [],
+        }
+
+    return {
+        "action": "remux",
+        "audio": audio,
+        "subtitles": subtitles,
+        "default_id": keep_preferred["id"],
+        "keep": keep,
+        "drop": drop,
+        "freed": sum(t["_size"] for t in drop),
+    }
+
+
+def apply_flags(path, plan):
+    """Sets the default flag in place. No rewrite, so this is near-instant."""
+    cmd = ["mkvpropedit", path]
+    for track in plan["audio"]:
+        wanted = "1" if track["id"] == plan["default_id"] else "0"
+        # mkvpropedit counts tracks from 1, in file order.
+        cmd += ["--edit", f"track:{track['id'] + 1}", "--set", f"flag-default={wanted}"]
+    for track in plan.get("subtitles", []):
+        if track["properties"].get("default_track"):
+            cmd += ["--edit", f"track:{track['id'] + 1}", "--set", "flag-default=0"]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        return f"mkvpropedit failed: {(exc.stderr or '').strip()[:200]}"
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def verify_remux(temp_path, plan, source_info):
+    """Confirms the new file really is the old one minus the dropped tracks.
+
+    Nothing is deleted until this passes, so a bad remux costs us a temp file
+    and nothing else.
+    """
+    info = probe_tracks(temp_path)
+    if info is None:
+        return "result is not a readable Matroska file"
+
+    new_audio = [t for t in info.get("tracks", []) if t.get("type") == "audio"]
+    want = sorted(track_language(t) for t in plan["keep"])
+    got = sorted(track_language(t) for t in new_audio)
+    if got != want:
+        return f"expected audio {want}, got {got}"
+
+    old_video = len([t for t in source_info.get("tracks", []) if t.get("type") == "video"])
+    new_video = len([t for t in info.get("tracks", []) if t.get("type") == "video"])
+    if new_video != old_video:
+        return f"video tracks changed ({old_video} -> {new_video})"
+
+    old_subs = len([t for t in source_info.get("tracks", []) if t.get("type") == "subtitles"])
+    new_subs = len([t for t in info.get("tracks", []) if t.get("type") == "subtitles"])
+    if new_subs != old_subs:
+        return f"subtitle tracks changed ({old_subs} -> {new_subs})"
+
+    defaults = [t for t in new_audio if t["properties"].get("default_track")]
+    if len(defaults) != 1:
+        return f"expected exactly one default audio track, found {len(defaults)}"
+    expected_default = track_language(
+        next(t for t in plan["keep"] if t["id"] == plan["default_id"])
+    )
+    if track_language(defaults[0]) != expected_default:
+        return f"default track is {track_language(defaults[0])}, expected {expected_default}"
+
+    old_ms = (source_info.get("container", {}).get("properties", {}) or {}).get("duration")
+    new_ms = (info.get("container", {}).get("properties", {}) or {}).get("duration")
+    if old_ms and new_ms and abs(old_ms - new_ms) > 2_000_000_000:  # 2s in ns
+        return f"duration changed ({old_ms} -> {new_ms})"
+
+    if os.path.getsize(temp_path) == 0:
+        return "result is empty"
+    return None
+
+
+def apply_remux(path, plan, source_info):
+    """Remuxes to a temp file, verifies it, and only then replaces the original."""
+    size = os.path.getsize(path)
+    free = shutil.disk_usage(os.path.dirname(path) or ".").free
+    if free < size:
+        return f"not enough free space ({human_size(free)} free, need {human_size(size)})"
+
+    temp_path = path + TEMP_SUFFIX
+    keep_ids = ",".join(str(t["id"]) for t in plan["keep"])
+    cmd = ["mkvmerge", "-q", "-o", temp_path, "--audio-tracks", keep_ids]
+    for track in plan["keep"]:
+        flag = "1" if track["id"] == plan["default_id"] else "0"
+        cmd += ["--default-track-flag", f"{track['id']}:{flag}"]
+    # Subtitles and everything else (chapters, attachments, tags) come along
+    # untouched; we only make sure no subtitle auto-enables itself.
+    for track in plan.get("subtitles", []):
+        cmd += ["--default-track-flag", f"{track['id']}:0"]
+    cmd.append(path)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        # mkvmerge uses exit code 1 for warnings, which are not fatal.
+        if result.returncode > 1:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, result.stdout, result.stderr
+            )
+    except subprocess.CalledProcessError as exc:
+        _discard(temp_path)
+        return f"mkvmerge failed: {(exc.stderr or '').strip()[:200]}"
+    except OSError as exc:
+        _discard(temp_path)
+        return str(exc)
+
+    problem = verify_remux(temp_path, plan, source_info)
+    if problem:
+        _discard(temp_path)
+        return f"verification failed: {problem}"
+
+    try:
+        os.replace(temp_path, path)
+    except OSError as exc:
+        _discard(temp_path)
+        return f"could not replace original: {exc}"
+    return None
+
+
+def _discard(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def render_audio_plan(relative_path, plan, target=None):
+    """Prints the full per-track breakdown shown before the confirmation."""
+    click.secho(relative_path, bold=True)
+    action = plan["action"]
+
+    if action == "skip":
+        click.secho(f"  SKIP  {plan['reason']}", fg="red")
+        return
+    if action == "none":
+        click.secho(f"  OK    {plan.get('reason', 'nothing to do')}", dim=True)
+        return
+
+    keep_ids = {t["id"] for t in plan["keep"]}
+    for track in plan["audio"]:
+        size = human_size(track.get("_size"))
+        if track["id"] in keep_ids:
+            suffix = "  -> default" if track["id"] == plan["default_id"] else ""
+            click.secho(
+                f"  KEEP  {describe_track(track):<34} {size:>8}{suffix}", fg="green"
+            )
+        else:
+            click.secho(f"  DROP  {describe_track(track):<34} {size:>8}", fg="red")
+
+    for track in plan.get("subtitles", []):
+        if track["properties"].get("default_track"):
+            click.secho(
+                f"  SUBS  {track_language(track)} default flag cleared", fg="yellow"
+            )
+
+    if action == "flags":
+        click.secho("  (flag change only, no remux)", dim=True)
+    if target:
+        click.secho(f"  -> {target}", fg="cyan")
+
+
+# --- Filling in what the filename does not say ---------------------------
+#
+# Some filenames are abbreviated to the point of being useless ("abc-x.1080p.mkv")
+# while the MKV's own metadata and the folder name still carry title and year.
+
+# Placeholder names and muxing-tool defaults that are not really titles.
+JUNK_TITLE_WORDS = {
+    "video",
+    "movie",
+    "film",
+    "untitled",
+    "unknown",
+    "encode",
+    "encoded",
+    "output",
+    "default",
+    "title",
+    "mkv",
+    "sample",
+}
+# Common muxing/transcoding tools leave their own name in the title field.
+JUNK_TITLE_RE = re.compile(
+    r"^(encoded|created|muxed|converted|generated)\s+(by|with)\b|^handbrake|^makemkv",
+    re.IGNORECASE,
+)
+
+MIN_YEAR = 1900
+MAX_YEAR = 2100
+
+
+def embedded_title(path):
+    """The title stored inside the Matroska container, if there is a usable one."""
+    if not path.lower().endswith(".mkv"):
+        return None
+    info = probe_tracks(path)
+    if info is None:
+        return None
+    title = (info.get("container", {}).get("properties", {}) or {}).get("title")
+    if not title:
+        return None
+    title = title.strip()
+    if not title:
+        return None
+
+    # Guard against tool defaults, which guessit would happily accept.
+    if JUNK_TITLE_RE.search(title):
+        return None
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    if not words:
+        return None
+    if len(words) == 1 and words[0] in JUNK_TITLE_WORDS:
+        return None
+    return title
+
+
+def year_from_folders(path, levels=3):
+    """Last resort: a plain 4-digit year in an ancestor folder name.
+
+    Returns (year, note). The year is None when nothing was found, or when a
+    folder offers more than one candidate and we refuse to guess between them.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    for _ in range(levels):
+        name = os.path.basename(directory)
+        if not name:
+            break
+        # Split on the usual filename separators. Resolution tokens such as
+        # 1080p keep their letter, so they never look like a bare year, and the
+        # range check rules out 720/1080/2160 on their own.
+        tokens = re.split(r"[^0-9A-Za-z]+", name)
+        candidates = []
+        for token in tokens:
+            if len(token) == 4 and token.isdigit():
+                value = int(token)
+                if MIN_YEAR <= value <= MAX_YEAR and value not in candidates:
+                    candidates.append(value)
+        if len(candidates) == 1:
+            return candidates[0], None
+        if len(candidates) > 1:
+            return None, f"folder '{name}' offers several years {candidates}"
+        directory = os.path.dirname(directory)
+    return None, None
+
+
+def enrich_guess(guess, path, media_type):
+    """Adds title and year from the MKV metadata and the folder name.
+
+    The filename stays in charge of everything else (resolution, episode
+    numbers); this only fills in what abbreviated filenames tend to omit.
+    """
+    notes = []
+    title = embedded_title(path)
+    if title:
+        inner = guessit(title)
+        inner_title = inner.get("title")
+        inner_year = inner.get("year")
+
+        if media_type == "episode":
+            # A series file's container title is often the EPISODE name, which
+            # would be a terrible series title. Only trust it when it actually
+            # looks like a series designation.
+            usable = inner.get("type") == "episode" and inner_title
+        else:
+            usable = bool(inner_title)
+
+        if usable and inner_title:
+            if inner_title != guess.get("title"):
+                notes.append(f"title from MKV metadata: {inner_title!r}")
+            guess["title"] = inner_title
+            if inner_year:
+                guess["year"] = inner_year
+
+    if not guess.get("year"):
+        year, problem = year_from_folders(path)
+        if year:
+            guess["year"] = year
+            notes.append(f"year {year} from folder name")
+        elif problem:
+            notes.append(problem)
+
+    return guess, notes
+
+
 def sanitize_component(value):
     """Strips anything from a template variable that could escape the target dir.
 
@@ -137,6 +690,10 @@ def sanitize_component(value):
     text = text.replace(os.sep, " ")
     if os.altsep:
         text = text.replace(os.altsep, " ")
+    # ':' is legal on APFS but not on exFAT/NTFS/SMB, where media drives
+    # usually live. The " - " form is the usual media-server convention.
+    text = text.replace(":", " -")
+    text = re.sub(r'[*?"<>|]', "", text)
     text = re.sub(r"[\x00-\x1f]", "", text)
     text = text.strip(" .")
     return " ".join(text.split())
@@ -298,6 +855,120 @@ def rollback(moves):
     return restored
 
 
+def collect_media(cwd, extensions):
+    """Snapshot of every media file under cwd, in stable order."""
+    found = []
+    for root, _, files in os.walk(cwd):
+        for file in sorted(files):
+            if file.lower().endswith(extensions) and not file.endswith(TEMP_SUFFIX):
+                found.append(os.path.join(root, file))
+    found.sort()
+    return found
+
+
+def build_audio_plans(paths, config, cwd):
+    """Works out what each file needs. Returns (actionable, untouched)."""
+    actionable = []  # (path, plan, source_info)
+    untouched = []  # (relative path, reason)
+
+    for path in paths:
+        relative = os.path.relpath(path, cwd)
+        if not path.lower().endswith(".mkv"):
+            untouched.append((relative, "not a Matroska file, audio left alone"))
+            continue
+
+        info = probe_tracks(path)
+        if info is None:
+            untouched.append((relative, "could not read with mkvmerge"))
+            continue
+
+        plan = plan_audio(info, config, path)
+        if plan["action"] in ("none", "skip"):
+            untouched.append((relative, plan.get("reason", plan["action"])))
+            continue
+        actionable.append((path, plan, info))
+
+    return actionable, untouched
+
+
+def run_audio_phase(actionable, cwd):
+    """Applies each plan one file at a time. Returns the paths that failed."""
+    failed = {}
+    for path, plan, info in actionable:
+        relative = os.path.relpath(path, cwd)
+        click.echo(f"Processing: {relative}")
+
+        if plan["action"] == "flags":
+            problem = apply_flags(path, plan)
+        else:
+            problem = apply_remux(path, plan, info)
+
+        if problem:
+            click.secho(f"  !! {problem} (original left untouched)", fg="red")
+            failed[path] = problem
+        else:
+            freed = plan.get("freed")
+            note = f", freed {human_size(freed)}" if freed else ""
+            click.secho(f"  done{note}", fg="green")
+    return failed
+
+
+def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
+    """Plan, show, confirm, execute. Shared by `audio` and `organize --audio`.
+
+    Returns (failed paths -> reason, confirmed) where confirmed is False if the
+    user declined, so the caller can stop before renaming anything.
+    """
+    if paths is None:
+        paths = collect_media(cwd, (".mkv", ".mp4", ".avi"))
+
+    actionable, untouched = build_audio_plans(paths, config, cwd)
+
+    for path, plan, _ in actionable:
+        render_audio_plan(os.path.relpath(path, cwd), plan)
+        click.echo()
+
+    if untouched:
+        click.secho("No audio change needed:", dim=True)
+        for relative, reason in untouched:
+            click.secho(f"  {relative}: {reason}", dim=True)
+        click.echo()
+
+    if not actionable:
+        click.secho("No audio changes to make.", fg="green")
+        return {}, True
+
+    remuxes = [p for _, p, _ in actionable if p["action"] == "remux"]
+    freed = sum(p.get("freed") or 0 for p in remuxes)
+    click.echo("-" * 40)
+    click.echo(
+        f"{len(actionable)} file(s): {len(remuxes)} remux, "
+        f"{len(actionable) - len(remuxes)} flag-only. "
+        f"Frees about {human_size(freed)}."
+    )
+
+    if dry_run:
+        click.secho("Dry run, nothing changed.", fg="yellow")
+        return {}, False
+
+    if not assume_yes:
+        click.secho(
+            "Remuxing is irreversible: dropped tracks cannot be recovered.", fg="yellow"
+        )
+        if not click.confirm("Proceed?", default=False):
+            click.secho("Aborted, nothing changed.", fg="yellow")
+            return {}, False
+
+    click.echo("-" * 40)
+    failed = run_audio_phase(actionable, cwd)
+    click.echo("-" * 40)
+    click.secho(
+        f"Audio complete. {len(actionable) - len(failed)} changed, {len(failed)} failed.",
+        fg="green" if not failed else "yellow",
+    )
+    return failed, True
+
+
 @click.group()
 def cli():
     """Maatr: Bring balance and order to your media library."""
@@ -324,6 +995,18 @@ def init(is_global):
 
 
 @cli.command()
+@click.option("--dry-run", is_flag=True, help="Show the plan and exit without changing anything.")
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip the confirmation prompt.")
+def audio(dry_run, assume_yes):
+    """Reduce audio tracks to one preferred and one secondary language."""
+    cwd = os.getcwd()
+    config = load_config()
+    click.echo(f"Scanning {cwd} ...")
+    click.echo("-" * 40)
+    audio_pass(cwd, config, dry_run, assume_yes)
+
+
+@cli.command()
 @click.option("--dry-run", is_flag=True, help="Preview changes without moving files.")
 @click.option("--ask", is_flag=True, help="Ask for confirmation on unknown files.")
 @click.option(
@@ -331,7 +1014,9 @@ def init(is_global):
     is_flag=True,
     help="Organize every file that can be identified, instead of skipping its whole folder.",
 )
-def organize(dry_run, ask, partial):
+@click.option("--audio", "do_audio", is_flag=True, help="Clean up audio tracks first.")
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip the audio confirmation prompt.")
+def organize(dry_run, ask, partial, do_audio, assume_yes):
     """Organize media files in the current directory."""
     cwd = os.getcwd()
     config = load_config()
@@ -344,12 +1029,16 @@ def organize(dry_run, ask, partial):
     # Snapshot the file list before touching anything: moving files into
     # subdirectories of a tree we are still walking would make os.walk hand us
     # our own output again.
-    candidates = []
-    for root, _, files in os.walk(cwd):
-        for file in sorted(files):
-            if file.lower().endswith(valid_exts):
-                candidates.append(os.path.join(root, file))
-    candidates.sort()
+    candidates = collect_media(cwd, valid_exts)
+
+    # Audio first: dropping tracks changes the {audio} part of the new name, so
+    # the rename has to see the cleaned file, not the original.
+    audio_failed = {}
+    if do_audio:
+        audio_failed, confirmed = audio_pass(cwd, config, dry_run, assume_yes, candidates)
+        if not confirmed:
+            return
+        click.echo("-" * 40)
 
     planned = {}  # group key -> list of (original_path, new_path, relative_new_path)
     labels = {}  # group key -> display name
@@ -371,8 +1060,18 @@ def organize(dry_run, ask, partial):
         key, label = group_for(original_path, cwd)
         labels.setdefault(key, label)
 
+        # Its audio is not what the approved plan said, so its name would not be
+        # either. Leave it alone entirely rather than move it under a wrong name.
+        if original_path in audio_failed:
+            note_skip(
+                original_path,
+                f"audio step failed ({audio_failed[original_path]})",
+                breaks_group=False,
+            )
+            continue
+
         # Feed the whole relative path to guessit: when the filename itself is
-        # cryptic, the folder it sits in usually still carries the series name.
+        # cryptic, the folder it sits in often still carries the series name.
         guess = guessit(relative_source)
         media_type = guess.get("type")
         overrides = {}
@@ -394,6 +1093,12 @@ def organize(dry_run, ask, partial):
             else:
                 note_skip(original_path, "could not tell movie from episode")
                 continue
+
+        # Abbreviated filenames often omit the title and year that the
+        # container metadata and the folder name still carry.
+        guess, notes = enrich_guess(guess, original_path, media_type)
+        for note in notes:
+            click.secho(f"  {relative_source}: {note}", dim=True)
 
         missing = missing_fields(guess, media_type)
         if missing:

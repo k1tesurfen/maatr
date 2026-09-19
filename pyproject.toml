@@ -15,3 +15,7 @@ dependencies = [
 [project.scripts]
 maatr = "maatr:cli"
 mtr = "maatr:cli"
+
+[tool.setuptools]
+# Only maatr.py is the package; test_audio_rules.py stays out of the wheel.
+py-modules = ["maatr"]
