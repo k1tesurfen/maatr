@@ -47,7 +47,35 @@ maatr organize
 ```
 
 - Use `--dry-run` to see what would happen without moving files.
-- Use `--ask` to manually confirm media types for files that can't be automatically identified.
+- Use `--ask` to fill in the details Maatr could not read from a file (media type, title, season, episode).
+- Use `--partial` to organize every file that can be identified instead of skipping its whole folder.
+
+#### All or nothing per folder
+
+Each immediate subdirectory of the directory you run in is organized as a unit. If a single file in it cannot be identified, that whole folder is left exactly as it was — no half-renamed seasons to pick apart by hand.
+
+Folders are independent of each other, so running in a show's directory:
+
+```
+Season 1/   <- one unreadable file: the whole folder stays put
+Season 2/   <- clean: organized normally
+```
+
+Fix the one file in `Season 1`, re-run, and it goes through. Files sitting loose in the working directory belong to no folder, so each one stands or falls on its own.
+
+If a move fails partway through a folder (a disk error, or a target that appeared mid-run), the files already moved from that folder are put back and the undo log is trimmed accordingly.
+
+#### Safety rules
+
+Maatr will never destroy a file it cannot identify:
+
+- **No guessed names.** A file is only moved once its title is known, and an episode also needs a season and an episode number. Nothing is invented, so a folder of cryptic filenames can no longer collapse into a single `Unknown` file.
+- **No overwriting.** If two files resolve to the same target name, the second one stays where it is and is reported. The destination is reserved with an exclusive create before the move, so a collision can never silently replace an existing file.
+- **Folder context is used.** Maatr feeds the whole relative path to the parser, so a cryptic `ep1.mkv` inside `Breaking Bad/Season 2/` is still recognised.
+- **Titles cannot escape the directory.** Path separators and control characters are stripped from parsed values, and every target is verified to stay inside the working directory.
+- **Undo log is written as it goes.** The history file is saved after every move, so an interrupted run is still revertible, and `undo` refuses to overwrite a file that reappeared at the original path.
+
+Files that are left untouched are listed at the end of every run, with the reason.
 
 ### Undo
 
