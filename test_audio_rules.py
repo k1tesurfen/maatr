@@ -102,6 +102,74 @@ results.append(run("only commentary in GER -> falls back, still picks one",
     [t(1,"ger",60,name="Kommentar",default=True), t(2,"eng",280)],
     "flags", expect_keep=[1,2], expect_default=2))
 
+
+# The name a dry run previews has to be the name the live run produces, so the
+# {audio} tag comes from the plan's surviving tracks, not from probing a file
+# whose extra tracks are about to be dropped.
+print("== the previewed {audio} tag matches what the remux will leave ==")
+TAG_CFG = {"audio": {"preferred": "eng", "secondary": "ger", "fallback_default": "ger",
+                     "enforce_first": "ENG", "default_fallback": "ENG",
+                     "mapping": {"ger": "GER", "deu": "GER", "eng": "ENG", "ita": "ITA"}}}
+for name, tracks, want in [
+    ("trilingual remux drops ITA", [t(1,"ger",300), t(2,"eng",600), t(3,"ita",300)], "ENG-GER"),
+    ("flag-only run keeps both", [t(1,"ger",300,default=True), t(2,"eng",600)], "ENG-GER"),
+    ("preferred is always listed first", [t(1,"ger",300), t(2,"eng",600)], "ENG-GER"),
+    ("unmapped language falls back to its code", [t(1,"ger",300), t(2,"eng",600), t(3,"pol",300)], "ENG-GER"),
+]:
+    info = {"tracks": [{"id": 0, "type": "video", "codec": "AVC", "properties": {}}] + tracks}
+    plan = maatr.plan_audio(info, TAG_CFG, path=None)
+    got = maatr.audio_tag_from_plan(plan, TAG_CFG)
+    ok = got == want
+    print(("  PASS  " if ok else "  FAIL  ") + f"{name}: {got}" + ("" if ok else f" want {want}"))
+    results.append(ok)
+
+
+# A container is as long as its longest track, so dropping the longest one
+# shortens the file legitimately. Comparing the old container duration with the
+# new one called that a corrupt remux and refused a perfectly good rewrite.
+print("== duration is verified against the surviving tracks ==")
+
+def dur(track, value):
+    track["properties"]["tag_duration"] = value
+    return track
+
+def vid(value):
+    return {"id": 0, "type": "video", "codec": "AVC",
+            "properties": {"tag_duration": value}}
+
+for name, value, want in [
+    ("h:mm:ss with nanoseconds", "02:00:17.418000000", 7217418000000),
+    ("no fractional part", "00:00:10", 10_000_000_000),
+    ("not a duration at all", "soon", None),
+    ("missing", None, None),
+]:
+    got = maatr.parse_duration_tag(value)
+    ok = got == want
+    print(("  PASS  " if ok else "  FAIL  ") + f"{name}: {got}" + ("" if ok else f" want {want}"))
+    results.append(ok)
+
+# The real case: a German release carrying a Russian dub that runs 18s past the
+# picture, so the Russian track alone defines the container duration.
+SOURCE = {"container": {"properties": {"duration": 7236013000000}},  # 02:00:36.013
+          "tracks": [vid("02:00:17.418"),
+                     dur(t(1, "ger", 330), "02:00:16.288"),
+                     dur(t(2, "eng", 330), "02:00:17.248"),
+                     dur(t(3, "jpn", 330), "02:00:16.288"),
+                     dur(t(4, "tur", 165), "02:00:25.152"),
+                     dur(t(5, "rus", 331), "02:00:36.000")]}
+plan = maatr.plan_audio(SOURCE, CFG, path=None)
+expected = maatr.expected_duration_ns(SOURCE, plan)
+for name, got, want in [
+    ("the dropped Russian track is not counted", expected, 7217418000000),
+    ("expected is the video, not the old container", expected != 7236013000000, True),
+    ("a file with no duration tags gives None",
+     maatr.expected_duration_ns({"tracks": [t(1, "ger", 330)]},
+                                {"keep": [t(1, "ger", 330)]}), None),
+]:
+    ok = got == want
+    print(("  PASS  " if ok else "  FAIL  ") + f"{name}: {got}" + ("" if ok else f" want {want}"))
+    results.append(ok)
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

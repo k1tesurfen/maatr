@@ -49,6 +49,8 @@ maatr organize
 - Use `--dry-run` to see what would happen without moving files.
 - Use `--ask` to fill in the details Maatr could not read from a file (media type, title, season, episode).
 - Use `--partial` to organize every file that can be identified instead of skipping its whole folder.
+- Use `--no-lookup` to keep the title as parsed instead of asking TMDB for the international one.
+- Use `--no-cache` to ignore stored TMDB lookups and ask again.
 
 #### All or nothing per folder
 
@@ -67,11 +69,12 @@ If a move fails partway through a folder (a disk error, or a target that appeare
 
 #### Where the name comes from
 
-Filenames are sometimes abbreviated to the point of being useless — `abc-x.1080p.mkv` yields only a lowercase "x" and no year at all. Maatr therefore reads three sources, in this order of authority:
+Filenames are sometimes abbreviated to the point of being useless — `abc-x.1080p.mkv` yields only a lowercase "x" and no year at all. Maatr therefore reads four sources, in this order of authority:
 
-1. **The MKV's own title metadata.** Files often store the full title, and frequently the year with it. When present and plausible, this wins for title and year.
-2. **The filename**, for everything else: resolution, season and episode numbers.
-3. **The folder name**, as a last resort for the year only — a plain number between 1900 and 2100. Resolution tokens (`2160p`, `1080p`, `1920x1080`) can never be read as years. If a folder offers two candidates, Maatr refuses to pick and says so.
+1. **TMDB**, for the international title of a film — see below. This overrules everything else.
+2. **The MKV's own title metadata.** Files often store the full title, and frequently the year with it. When present and plausible, this wins for title and year.
+3. **The filename**, for everything else: resolution, season and episode numbers.
+4. **The folder name**, as a last resort for the year only — a plain number between 1900 and 2100. Resolution tokens (`2160p`, `1080p`, `1920x1080`) can never be read as years. If a folder offers two candidates, Maatr refuses to pick and says so.
 
 ```
 Example.Movie.2018.1080p-ABC/abc-x.1080p.mkv
@@ -88,7 +91,68 @@ Two guards keep this from making things worse:
 
 A generic parent folder like `Movies` or `Downloads` is never used as a title — only as a possible source of a year.
 
-Note that `:` is replaced with ` - ` in filenames, since it is illegal on exFAT, NTFS and SMB shares, where media drives usually live.
+#### The international title
+
+German releases are named after the dubbed title, which is often a different film's name entirely. Maatr looks the film up on [TMDB](https://www.themoviedb.org) and uses the international English title instead:
+
+```
+Phantastische.Tierwesen.Grindelwalds.Verbrechen.2018.German...mkv
+  -> Fantastic Beasts - The Crimes of Grindelwald (2018)/...mkv
+```
+
+There are two ways in, and the first is exact:
+
+1. **The IMDb id from a `.nfo` sidecar.** Scene releases ship one, and it identifies the film outright — no matching, no ambiguity. The `.nfo` is only read; it is never moved, renamed or deleted, and neither is the folder it sits in.
+2. **A title-and-year search.** Used when there is no `.nfo`. A hit is only accepted when its release year is within one year of the year Maatr already knows. Without a year to check against, or with no hit near it, **the title stays as it was** and the file is reported with the reason. A wrong film is worse than a German name.
+
+A successful lookup also takes the year from TMDB, and the title is used with TMDB's own casing (so `WALL-E` stays `WALL-E`).
+
+This needs a free credential: themoviedb.org → Settings → API → Developer. That page gives you two, and **either works** — Maatr uses the v3 endpoints and tells them apart automatically:
+
+- the **API Key**, 32 hex characters, sent as `?api_key=…` (v3 auth);
+- the **API Read Access Token**, a JWT, sent as an `Authorization: Bearer` header — it never appears in a URL, so it cannot leak into a log.
+
+Put it in `$TMDB_API_KEY`, or in `[lookup] api_key` in your config — preferably the global one at `~/.config/maatr/maatr.toml`, so it does not end up in a repository. Without a key, or without a network, the lookup is skipped, every affected file is reported, and the run carries on with the parsed name. Results are cached in `~/.cache/maatr/lookup.json`, so a `--dry-run` warms the cache for the live run.
+
+Series are not looked up; this applies to films only.
+
+#### Samples and other extras
+
+Releases often ship a small preview beside the film. Both files parse to the same title and year, so both want the same name — which used to fail the whole folder. Two rules sort it out, in order:
+
+1. **By name.** A file is an extra when `sample`, `trailer` or `proof` sits at the *end* of its name (`...-sample.mkv`, `movie.sample.mkv`), or when it lives in a `Sample/`, `Extras/`, `Featurettes/` or `Bonus/` folder. The token must be at the end, so a real film called *Sample People (2000)* is never caught.
+2. **By structure.** One folder per movie, one movie file per movie folder: in a folder whose files parse as a **movie**, the largest one is the film and the rest are extras — whatever they are called. This catches anything the vocabulary misses.
+
+Rule 2 is deliberately fenced in:
+
+- **Season folders are exempt.** A folder containing episodes is never reduced; every episode survives.
+- **The winner must be at least 4× the runner-up.** A sample is about 1% of the film, so the rule always fires for the real case. Two comparable files — a genuine double feature, or a CD1/CD2 split — are an ambiguity, and the folder fails loudly instead of quietly sidelining half a movie.
+- **A folder of nothing but extras organizes nothing**, so a 64 MB preview never lands in your library under the film's name.
+
+Extras are **left exactly where they are**, like the `.nfo` — never moved, renamed or deleted — and listed at the end of the run with the reason. They are also skipped by the audio pass, so a sample never costs you a remux.
+
+```
+Die.purpurnen.Fluesse.2000...CONTRiBUTiON/
+  ...contribution.mkv         10G  -> The Crimson Rivers (2000)/...mkv
+  ...contribution.sample.mkv   64M -> left untouched: sample file, not the feature
+```
+
+#### Names that survive the trip to a NAS
+
+Media drives are read over SMB from more than one operating system, so titles are reduced to plain ASCII. macOS stores umlauts decomposed and a NAS expects them composed; the two are different bytes and do not compare equal, which is how the same file ends up visible under two names, or under none.
+
+| | |
+|---|---|
+| `Ä Ö Ü ä ö ü ß` | `Ae Oe Ue ae oe ue ss` — German first, so `Ä` becomes `Ae` and not `A` |
+| `Amélie`, `Pokémon` | `Amelie`, `Pokemon` — remaining accents are stripped to their base letter |
+| `Solo: A Star Wars Story` | `Solo - A Star Wars Story` — any `:`, with or without a space |
+| `Mike's Dream`, `Mamma Mia!` | `Mikes Dream`, `Mamma Mia` — `' ’ , ! ?` are dropped |
+| `Fire & Ice` | `Fire and Ice` |
+| `/ \ * ? " < > \|` and control characters | removed; a title can never steer the move |
+
+Names are also capped at 255 bytes per level, keeping the extension.
+
+This applies to new runs only — files you organized earlier keep their names until you run `organize` over them again. The table can be extended under `[naming]` in the config.
 
 #### Safety rules
 
@@ -176,4 +240,30 @@ Maatr searches for a `maatr.toml` file in the following order:
 2. `~/.config/maatr/maatr.toml`.
 
 If no file is found, it uses its internal defaults. You can edit the config file to customize your naming templates and audio language mappings.
+
+```toml
+[lookup]
+enabled = true            # or organize --no-lookup for one run
+api_key = ""              # $TMDB_API_KEY wins over this
+language = "en-US"
+timeout = 8
+cache = "~/.cache/maatr/lookup.json"
+
+[naming]
+ascii_only = true
+colon = " - "
+drop = "'’‘`,!?¿¡"
+
+[organize]
+primary_by_size = true      # largest file in a movie folder is the film
+primary_size_ratio = 4      # ...but only if it is this much bigger
+extra_tokens = ["sample", "trailer", "proof"]
+extra_dirs = ["sample", "extras", "featurettes", "bonus"]
+
+[naming.replace]          # extends the built-in table, does not replace it
+"ß" = "ss"
+"&" = " and "
+```
+
+Note that config files are **not** merged with the defaults — the first file found is used as-is. Any setting you leave out falls back to Maatr's built-in value, so a partial file is safe.
 

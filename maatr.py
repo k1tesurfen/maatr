@@ -4,6 +4,10 @@ import re
 import shutil
 import subprocess
 import tomllib
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 import click
 from guessit import guessit
 
@@ -11,6 +15,7 @@ STATE_FILE = ".maatr_history.json"
 LOCAL_CONFIG = "maatr.toml"
 GLOBAL_CONFIG_DIR = os.path.expanduser("~/.config/maatr")
 GLOBAL_CONFIG_FILE = os.path.join(GLOBAL_CONFIG_DIR, "maatr.toml")
+DEFAULT_LOOKUP_CACHE = "~/.cache/maatr/lookup.json"
 
 DEFAULT_CONFIG = """
 [templates.movie]
@@ -22,6 +27,51 @@ file = "{title} ({year}) [{resolution}] [{audio}]{ext}"
 # Available variables: title, season, episode, season_pad, episode_pad, resolution, audio, ext
 folder = "{title}/{title} Season {season}/{title} S{season_pad}E{episode_pad}"
 file = "{title} S{season_pad}E{episode_pad} [{resolution}] [{audio}]{ext}"
+
+[naming]
+# Filenames are written to exFAT/NTFS/SMB drives, where macOS' decomposed
+# umlauts and the NAS' composed ones are not the same bytes. Going to plain
+# ASCII sidesteps the whole problem.
+ascii_only = true
+colon = " - "
+drop = "'’‘`,!?¿¡"
+
+# Applied before the accent stripping, so 'Ä' becomes 'Ae' and not 'A'.
+[naming.replace]
+"Ä" = "Ae"
+"Ö" = "Oe"
+"Ü" = "Ue"
+"ä" = "ae"
+"ö" = "oe"
+"ü" = "ue"
+"ß" = "ss"
+"&" = " and "
+
+[organize]
+# One folder per movie, one movie file per movie folder: anything else in a
+# movie's folder is not the movie. In a folder whose files parse as a movie the
+# largest one wins, provided it is clearly larger — two near-equal files are an
+# ambiguity worth reporting, not a sample. Season folders are exempt, so every
+# episode survives.
+primary_by_size = true
+primary_size_ratio = 4
+extra_tokens = ["sample", "trailer", "proof"]
+extra_dirs = ["sample", "samples", "trailer", "trailers", "proof",
+              "extra", "extras", "featurette", "featurettes", "bonus",
+              "behind the scenes"]
+
+[lookup]
+# German releases carry dubbed German titles. Look the film up on TMDB and use
+# its international English title instead. A free key: themoviedb.org ->
+# Settings -> API -> Developer. $TMDB_API_KEY overrides the value here.
+enabled = true
+provider = "tmdb"
+# Either credential works: the 32-hex "API Key" or the "API Read Access
+# Token" (a JWT, sent as a bearer header). $TMDB_API_KEY overrides this.
+api_key = ""
+language = "en-US"
+timeout = 8
+cache = "~/.cache/maatr/lookup.json"
 
 [audio]
 enforce_first = "ENG"
@@ -92,12 +142,46 @@ def cleanup_empty_dirs(directory):
     return cleaned_count
 
 
+def format_audio_tag(mapped_langs, config):
+    """Orders already-mapped language codes into the {audio} part of a name.
+
+    Shared so a predicted tag and a probed one can never disagree on ordering.
+    """
+    audio_cfg = config.get("audio", {})
+    fallback = audio_cfg.get("default_fallback", "ENG")
+    enforce_first = audio_cfg.get("enforce_first", "ENG")
+
+    langs_list = sorted(set(mapped_langs))
+    if not langs_list:
+        return fallback
+    if enforce_first in langs_list:
+        langs_list.remove(enforce_first)
+        langs_list.insert(0, enforce_first)
+    return "-".join(langs_list)
+
+
+def audio_tag_from_plan(plan, config):
+    """The {audio} tag the file will carry once this audio plan has run.
+
+    A dry run has not dropped anything yet, so probing the file would describe
+    the tracks that are about to go and preview a name the live run never
+    produces. The plan already knows exactly which tracks survive.
+    """
+    mapping = config.get("audio", {}).get("mapping", {})
+    mapped = []
+    for track in plan.get("keep", []):
+        lang = track_language(track)
+        if not lang or lang == "und":
+            continue
+        mapped.append(mapping.get(lang, lang.upper()[:3]))
+    return format_audio_tag(mapped, config)
+
+
 def get_audio_languages(filepath, config):
     """Probes for audio and uses the config mappings."""
     audio_cfg = config.get("audio", {})
     mapping = audio_cfg.get("mapping", {})
     fallback = audio_cfg.get("default_fallback", "ENG")
-    enforce_first = audio_cfg.get("enforce_first", "ENG")
 
     try:
         cmd = [
@@ -123,15 +207,7 @@ def get_audio_languages(filepath, config):
                 mapped_lang = mapping.get(lang_clean, lang_clean.upper()[:3])
                 langs.add(mapped_lang)
 
-        if not langs:
-            return fallback
-
-        langs_list = sorted(langs)
-        if enforce_first in langs_list:
-            langs_list.remove(enforce_first)
-            langs_list.insert(0, enforce_first)
-
-        return "-".join(langs_list)
+        return format_audio_tag(langs, config)
     except Exception:
         return fallback
 
@@ -423,6 +499,56 @@ def apply_flags(path, plan):
     return None
 
 
+def parse_duration_tag(value):
+    """'02:00:17.418000000' -> nanoseconds, or None if it is not one."""
+    if not value:
+        return None
+    match = re.fullmatch(r"(\d+):(\d{2}):(\d{2})(?:\.(\d+))?", str(value).strip())
+    if not match:
+        return None
+    hours, minutes, seconds, fraction = match.groups()
+    total = (int(hours) * 3600 + int(minutes) * 60 + int(seconds)) * 1_000_000_000
+    if fraction:
+        total += int(round(float(f"0.{fraction}") * 1_000_000_000))
+    return total
+
+
+def track_duration_ns(track):
+    return parse_duration_tag((track.get("properties") or {}).get("tag_duration"))
+
+
+def longest_track_ns(tracks):
+    """The duration of the longest track we can measure, or None."""
+    durations = [d for d in (track_duration_ns(t) for t in tracks) if d is not None]
+    return max(durations) if durations else None
+
+
+def expected_duration_ns(source_info, plan):
+    """How long the file should be once the dropped tracks are gone.
+
+    A Matroska container is as long as its longest track, so dropping the
+    longest one legitimately shortens the file — a German release may carry a
+    Russian dub running twenty seconds past the picture. Comparing the old
+    container duration with the new one calls that a corrupt remux.
+    """
+    keep_ids = {t["id"] for t in plan["keep"]}
+    surviving = [
+        track
+        for track in source_info.get("tracks", [])
+        if track.get("type") != "audio" or track.get("id") in keep_ids
+    ]
+    return longest_track_ns(surviving)
+
+
+def human_duration(nanoseconds):
+    if nanoseconds is None:
+        return "unknown"
+    seconds, fraction = divmod(int(nanoseconds), 1_000_000_000)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{fraction // 1_000_000:03d}"
+
+
 def verify_remux(temp_path, plan, source_info):
     """Confirms the new file really is the old one minus the dropped tracks.
 
@@ -458,10 +584,38 @@ def verify_remux(temp_path, plan, source_info):
     if track_language(defaults[0]) != expected_default:
         return f"default track is {track_language(defaults[0])}, expected {expected_default}"
 
-    old_ms = (source_info.get("container", {}).get("properties", {}) or {}).get("duration")
-    new_ms = (info.get("container", {}).get("properties", {}) or {}).get("duration")
-    if old_ms and new_ms and abs(old_ms - new_ms) > 2_000_000_000:  # 2s in ns
-        return f"duration changed ({old_ms} -> {new_ms})"
+    tolerance = 2_000_000_000  # 2s in ns
+
+    # The video is copied through untouched, so its length is the sharpest
+    # truncation check there is, and dropping audio cannot affect it.
+    old_video_ns = longest_track_ns(
+        [t for t in source_info.get("tracks", []) if t.get("type") == "video"]
+    )
+    new_video_ns = longest_track_ns(
+        [t for t in info.get("tracks", []) if t.get("type") == "video"]
+    )
+    if old_video_ns and new_video_ns and abs(old_video_ns - new_video_ns) > tolerance:
+        return (
+            f"video duration changed ({human_duration(old_video_ns)} -> "
+            f"{human_duration(new_video_ns)})"
+        )
+
+    old_ns = (source_info.get("container", {}).get("properties", {}) or {}).get("duration")
+    new_ns = (info.get("container", {}).get("properties", {}) or {}).get("duration")
+    expected_ns = expected_duration_ns(source_info, plan)
+    if new_ns and expected_ns:
+        # Compare against the longest *surviving* track, not the old container.
+        if abs(expected_ns - new_ns) > tolerance:
+            return (
+                f"duration changed (expected {human_duration(expected_ns)}, "
+                f"got {human_duration(new_ns)})"
+            )
+    elif old_ns and new_ns and abs(old_ns - new_ns) > tolerance:
+        # No per-track duration tags to reason with: fall back to the old
+        # comparison rather than skip the check.
+        return (
+            f"duration changed ({human_duration(old_ns)} -> {human_duration(new_ns)})"
+        )
 
     if os.path.getsize(temp_path) == 0:
         return "result is empty"
@@ -641,11 +795,246 @@ def year_from_folders(path, levels=3):
     return None, None
 
 
-def enrich_guess(guess, path, media_type):
-    """Adds title and year from the MKV metadata and the folder name.
+# --- The international title ---------------------------------------------
+#
+# German releases are named after the dubbed German title, which is often a
+# different film's name entirely. TMDB knows both, so we ask it for the
+# English one. Scene .nfo sidecars usually carry an IMDb id, which turns the
+# lookup from a fuzzy search into an exact one.
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+IMDB_ID_RE = re.compile(r"\btt\d{7,8}\b")
+
+
+def tmdb_key(config):
+    """The credential, environment first so it need not be written to disk."""
+    from_env = os.environ.get("TMDB_API_KEY", "").strip()
+    if from_env:
+        return from_env
+    return str((config or {}).get("lookup", {}).get("api_key", "") or "").strip()
+
+
+def is_bearer_token(key):
+    """TMDB hands out two credentials; tell them apart rather than 401.
+
+    The "API Key" is 32 hex characters and goes in the query string (v3 auth).
+    The "API Read Access Token" is a JWT — three dot-separated parts — and goes
+    in an Authorization header. Both work against the v3 endpoints used here.
+    """
+    return key.count(".") == 2 and len(key) > 40
+
+
+def tmdb_request(endpoint, params, config):
+    """One TMDB call. Returns (payload, error); exactly one is None.
+
+    Never raises: the caller keeps whatever title it already had.
+    """
+    key = tmdb_key(config)
+    if not key:
+        return None, "no TMDB key"
+    timeout = (config or {}).get("lookup", {}).get("timeout", 8)
+
+    headers = {}
+    if is_bearer_token(key):
+        headers["Authorization"] = f"Bearer {key}"
+        query = urllib.parse.urlencode(params)
+    else:
+        query = urllib.parse.urlencode(dict(params, api_key=key))
+
+    request = urllib.request.Request(f"{TMDB_BASE}{endpoint}?{query}", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        # A rejected credential is worth saying out loud: "unreachable" would
+        # send you looking at the network instead of at the key.
+        if exc.code in (401, 403):
+            kind = "read access token" if is_bearer_token(key) else "API key"
+            return None, f"TMDB rejected the {kind} (HTTP {exc.code})"
+        if exc.code == 429:
+            return None, "TMDB rate limit reached (HTTP 429)"
+        return None, f"TMDB returned HTTP {exc.code}"
+    except (OSError, ValueError) as exc:
+        # URLError, timeouts and unparseable bodies alike.
+        return None, f"TMDB unreachable ({exc.__class__.__name__})"
+
+
+def imdb_id_from_sidecar(path):
+    """The IMDb id from a .nfo next to the media file, if one is there.
+
+    Scene .nfo files are CP437 ASCII art, not UTF-8, so they are read
+    leniently; we only want the one id out of them.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    stem = os.path.splitext(os.path.basename(path))[0]
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return None
+
+    sidecars = [name for name in entries if name.lower().endswith(".nfo")]
+    # The one sharing the media file's name wins; the rest are a fallback.
+    sidecars.sort(key=lambda name: (os.path.splitext(name)[0] != stem, name))
+    for name in sidecars:
+        try:
+            with open(
+                os.path.join(directory, name), "r", encoding="cp437", errors="replace"
+            ) as f:
+                text = f.read(200_000)
+        except OSError:
+            continue
+        match = IMDB_ID_RE.search(text)
+        if match:
+            return match.group(0)
+    return None
+
+
+def pick_tmdb_movie(results, year):
+    """Chooses among search hits, or refuses to. Pure: no I/O.
+
+    Returns (result, reason); exactly one of the two is None. Without a year to
+    check against there is no way to tell the right film from a remake, so the
+    answer is no answer rather than a guess.
+    """
+    if not results:
+        return None, "no TMDB result"
+    if year is None:
+        return None, "no year to verify the match against"
+
+    near = []
+    for result in results:
+        released = str(result.get("release_date") or "")[:4]
+        if len(released) == 4 and released.isdigit():
+            if abs(int(released) - int(year)) <= 1:
+                near.append(result)
+    if not near:
+        return None, f"no TMDB result within a year of {year}"
+
+    # Deterministic: popularity, then id, so repeat runs agree.
+    near.sort(key=lambda r: (-(r.get("popularity") or 0), r.get("id") or 0))
+    return near[0], None
+
+
+def _tmdb_result_title(result, language):
+    """The English title and year out of a TMDB movie result."""
+    title = (result.get("title") or "").strip()
+    if not title:
+        return None, None
+    released = str(result.get("release_date") or "")[:4]
+    year = int(released) if len(released) == 4 and released.isdigit() else None
+    return title, year
+
+
+def lookup_title(guess, path, config, cache=None):
+    """Asks TMDB for the international title of this film.
+
+    Returns (title, year, source, reason). On any failure the title is None and
+    the reason says why, so the caller can keep the name it already had and
+    report it. Nothing here ever invents a title.
+    """
+    lookup_cfg = (config or {}).get("lookup", {}) or {}
+    if not lookup_cfg.get("enabled", True):
+        return None, None, None, None
+    if not tmdb_key(config):
+        return None, None, None, "no TMDB key (set $TMDB_API_KEY or [lookup].api_key)"
+
+    language = lookup_cfg.get("language", "en-US")
+    cache = cache if cache is not None else {}
+    imdb_id = imdb_id_from_sidecar(path)
+    local_title = guess.get("title")
+    year = guess.get("year")
+
+    if imdb_id:
+        cache_key = f"tt:{imdb_id}|{language}"
+        source = f"TMDB via {imdb_id}"
+    elif local_title:
+        cache_key = f"q:{str(local_title).casefold()}|{year or ''}|{language}"
+        source = "TMDB title search"
+    else:
+        return None, None, None, "no title to look up"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        if cached.get("title"):
+            return cached["title"], cached.get("year"), f"{source}, cached", None
+        return None, None, None, f"{cached.get('reason', 'no match')} (cached)"
+
+    def remember(title, found_year, reason):
+        cache[cache_key] = {"title": title, "year": found_year, "reason": reason}
+
+    if imdb_id:
+        payload, error = tmdb_request(
+            f"/find/{imdb_id}",
+            {"external_source": "imdb_id", "language": language},
+            config,
+        )
+        if payload is None:
+            # A refusal or an outage is not a verdict about the film, so it is
+            # not cached: the next run asks again.
+            return None, None, None, f"{error} for {imdb_id}"
+        results = payload.get("movie_results") or []
+        if not results:
+            remember(None, None, f"{imdb_id} is not a film on TMDB")
+            return None, None, None, f"{imdb_id} is not a film on TMDB"
+        title, found_year = _tmdb_result_title(results[0], language)
+        if not title:
+            remember(None, None, f"{imdb_id} has no English title")
+            return None, None, None, f"{imdb_id} has no English title"
+        remember(title, found_year, None)
+        return title, found_year, source, None
+
+    params = {"query": str(local_title), "language": language}
+    if year:
+        params["year"] = year
+    payload, error = tmdb_request("/search/movie", params, config)
+    if payload is None:
+        return None, None, None, f"{error} for {local_title!r}"
+
+    result, reason = pick_tmdb_movie(payload.get("results") or [], year)
+    if result is None:
+        remember(None, None, reason)
+        return None, None, None, reason
+    title, found_year = _tmdb_result_title(result, language)
+    if not title:
+        remember(None, None, "TMDB match has no English title")
+        return None, None, None, "TMDB match has no English title"
+    remember(title, found_year, None)
+    return title, found_year, source, None
+
+
+def lookup_cache_path(config):
+    setting = (config or {}).get("lookup", {}).get("cache", DEFAULT_LOOKUP_CACHE)
+    return os.path.expanduser(setting or DEFAULT_LOOKUP_CACHE)
+
+
+def load_lookup_cache(config):
+    try:
+        with open(lookup_cache_path(config), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_lookup_cache(config, cache):
+    """Best effort: an unwritable cache must never fail a run."""
+    path = lookup_cache_path(config)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+
+def enrich_guess(guess, path, media_type, config=None, lookup=False, cache=None):
+    """Adds title and year from the MKV metadata, the folder name and TMDB.
 
     The filename stays in charge of everything else (resolution, episode
     numbers); this only fills in what abbreviated filenames tend to omit.
+
+    Notes come back as (text, colour) pairs so the caller can print a failed
+    lookup differently from a successful one.
     """
     notes = []
     title = embedded_title(path)
@@ -664,7 +1053,7 @@ def enrich_guess(guess, path, media_type):
 
         if usable and inner_title:
             if inner_title != guess.get("title"):
-                notes.append(f"title from MKV metadata: {inner_title!r}")
+                notes.append((f"title from MKV metadata: {inner_title!r}", None))
             guess["title"] = inner_title
             if inner_year:
                 guess["year"] = inner_year
@@ -673,30 +1062,158 @@ def enrich_guess(guess, path, media_type):
         year, problem = year_from_folders(path)
         if year:
             guess["year"] = year
-            notes.append(f"year {year} from folder name")
+            notes.append((f"year {year} from folder name", None))
         elif problem:
-            notes.append(problem)
+            notes.append((problem, None))
+
+    # The German title is the dubbed one; TMDB knows what the film is really
+    # called. Series are left alone. A failure here costs nothing: the title
+    # parsed from the filename simply stands.
+    if lookup and media_type == "movie":
+        title, year, source, reason = lookup_title(guess, path, config, cache)
+        if title:
+            previous = guess.get("title")
+            if str(title) != str(previous):
+                notes.append((f"title from {source}: {previous!r} -> {title!r}", None))
+            guess["title"] = title
+            # TMDB's casing is the real one; do not re-case it later.
+            guess["_title_verbatim"] = True
+            if year:
+                guess["year"] = year
+        elif reason:
+            notes.append((f"keeping {guess.get('title')!r}: {reason}", "yellow"))
 
     return guess, notes
+
+
+# --- Names that survive the trip to the NAS ------------------------------
+#
+# The library lives on an external drive and is read over SMB. macOS hands out
+# decomposed umlauts (NFD), the NAS expects composed ones (NFC), and the two do
+# not compare equal, so the same file appears under two names or under none.
+# Transliterating to ASCII removes the question entirely.
+
+# Applied before the accent stripping below: 'Ä' has to become 'Ae', not 'A'.
+DEFAULT_REPLACE = {
+    "Ä": "Ae",
+    "Ö": "Oe",
+    "Ü": "Ue",
+    "ä": "ae",
+    "ö": "oe",
+    "ü": "ue",
+    "ß": "ss",
+    "Æ": "Ae",
+    "æ": "ae",
+    "Ø": "O",
+    "ø": "o",
+    "Å": "Aa",
+    "å": "aa",
+    "Þ": "Th",
+    "þ": "th",
+    "Ð": "D",
+    "ð": "d",
+    "&": " and ",
+    "·": "-",
+    "…": "...",
+    "–": "-",
+    "—": "-",
+    "‐": "-",
+    " ": " ",
+}
+# Legal in a filename, but noise in a title and awkward in a URL.
+DEFAULT_DROP = "'’‘`,!?¿¡"
+
+# Mutable so an optional [naming] section can extend it; apply_naming_config()
+# fills it in, and the defaults here stand on their own when no config says
+# otherwise (load_config does not merge, so every setting needs a Python-side
+# default).
+NAMING = {
+    "ascii_only": True,
+    "colon": " - ",
+    "replace": dict(DEFAULT_REPLACE),
+    "drop": DEFAULT_DROP,
+}
+
+# exFAT and most SMB servers cap a single name at 255 units.
+MAX_COMPONENT_BYTES = 255
+
+
+def apply_naming_config(config):
+    """Folds an optional [naming] section into the module-wide naming rules."""
+    naming = (config or {}).get("naming", {}) or {}
+    NAMING["ascii_only"] = naming.get("ascii_only", True)
+    NAMING["colon"] = naming.get("colon", " - ")
+    NAMING["drop"] = naming.get("drop", DEFAULT_DROP)
+    # Extend rather than replace: a user adding one mapping should not lose ß.
+    NAMING["replace"] = dict(DEFAULT_REPLACE, **(naming.get("replace", {}) or {}))
+
+
+def to_ascii(text):
+    """Transliterates to plain ASCII, German first, then accents in general."""
+    for source, target in NAMING["replace"].items():
+        text = text.replace(source, target)
+    if not NAMING["ascii_only"]:
+        return text
+    # Split the remaining accented letters into base + combining mark, drop the
+    # marks, then discard whatever still has no ASCII form at all.
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return text.encode("ascii", "ignore").decode("ascii")
 
 
 def sanitize_component(value):
     """Strips anything from a template variable that could escape the target dir.
 
     Template variables come from filenames we did not write, so a title like
-    "../../etc" or "Foo/Bar" must never be able to steer the move.
+    "../../etc" or "Foo/Bar" must never be able to steer the move. On top of
+    that the result has to be spellable on every filesystem the library is read
+    from, which means plain ASCII and no punctuation that needs quoting.
     """
-    text = str(value)
+    # Compose first: a macOS-supplied "A + combining diaeresis" has to look
+    # like 'Ä' before the transliteration table can recognise it.
+    text = unicodedata.normalize("NFC", str(value))
+    text = to_ascii(text)
+
     text = text.replace(os.sep, " ")
     if os.altsep:
         text = text.replace(os.altsep, " ")
+    # os.altsep is None on POSIX, so a backslash would survive here and turn
+    # into a separator the moment the drive is read from Windows.
+    text = text.replace("\\", " ")
+
     # ':' is legal on APFS but not on exFAT/NTFS/SMB, where media drives
-    # usually live. The " - " form is the usual media-server convention.
-    text = text.replace(":", " -")
+    # usually live. " - " is the usual media-server convention, and it is
+    # applied to a bare ':' too so none can ever reach a filename.
+    text = text.replace(":", NAMING["colon"])
     text = re.sub(r'[*?"<>|]', "", text)
-    text = re.sub(r"[\x00-\x1f]", "", text)
-    text = text.strip(" .")
+    if NAMING["drop"]:
+        text = text.translate({ord(c): None for c in NAMING["drop"]})
+    # Whitespace controls stand in for a space, or "Tab\there" becomes one
+    # word; the remaining C0 controls, DEL and the C1 block just go.
+    text = re.sub(r"[\t\n\r\v\f]", " ", text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+
+    # Collapse what the replacements above left behind: " - - " from a title
+    # that already contained a dash, and runs of spaces from "&" -> " and ".
+    text = " ".join(text.split())
+    text = re.sub(r"(?:\s-){2,}(?=\s)", " -", text)
+    text = text.strip(" .-")
     return " ".join(text.split())
+
+
+def cap_component(name, limit=MAX_COMPONENT_BYTES):
+    """Trims one path component to the filesystem's name limit, extension kept."""
+    if len(name.encode("utf-8")) <= limit:
+        return name
+    stem, ext = os.path.splitext(name)
+    room = limit - len(ext.encode("utf-8"))
+    if room <= 0:
+        return name[:limit]
+    while len(stem.encode("utf-8")) > room:
+        # Prefer cutting at a word boundary; fall back to a hard cut.
+        cut = stem.rfind(" ")
+        stem = stem[:cut] if cut > 0 else stem[: max(1, room)]
+    return stem.strip(" .-") + ext
 
 
 def format_path(template, data):
@@ -718,7 +1235,10 @@ def format_path(template, data):
     # Fix potential space before the file extension
     result = result.replace(" .", ".")
 
-    return result
+    # The template's own separators are intentional, so each level is capped on
+    # its own. A long English title plus the resolution and audio tags gets
+    # close to NAME_MAX on SMB.
+    return "/".join(cap_component(part) for part in result.split("/"))
 
 
 # Fields that must be known before a file may be moved. Nothing here gets a
@@ -745,8 +1265,12 @@ def missing_fields(guess, media_type, overrides=None):
     return missing
 
 
-def process_media(guess, filepath, config, media_type, overrides=None):
-    """Extracts variables and generates the final relative path based on config."""
+def process_media(guess, filepath, config, media_type, overrides=None, audio_tag=None):
+    """Extracts variables and generates the final relative path based on config.
+
+    `audio_tag` overrides the probe, for a preview of a file whose audio has
+    been planned but not yet rewritten.
+    """
     overrides = overrides or {}
 
     def field(name):
@@ -762,15 +1286,19 @@ def process_media(guess, filepath, config, media_type, overrides=None):
     if isinstance(season, list):
         season = season[0]
 
+    # A title from TMDB (or typed in by the user) is already correctly cased;
+    # .title() would turn "WALL-E" into "Wall-E" and "McDonald" into "Mcdonald".
+    verbatim = guess.get("_title_verbatim") and "title" not in overrides
+
     data = {
-        "title": str(title).title(),
+        "title": str(title) if verbatim else str(title).title(),
         "year": guess.get("year", ""),
         "season": season if season is not None else "",
         "episode": episode if episode is not None else "",
         "season_pad": str(season).zfill(2) if season is not None else "",
         "episode_pad": str(episode).zfill(2) if episode is not None else "",
         "resolution": guess.get("screen_size", ""),
-        "audio": get_audio_languages(filepath, config),
+        "audio": audio_tag or get_audio_languages(filepath, config),
         "ext": os.path.splitext(filepath)[1],
     }
 
@@ -821,6 +1349,93 @@ def prompt_for_fields(filename, media_type, missing):
                 return None
             overrides[f] = answer
     return overrides
+
+
+# --- Telling the film from the things shipped next to it -----------------
+#
+# A release folder often carries a small preview beside the feature. Both parse
+# to the same title and year, so both want the same name, and the collision
+# used to fail the whole folder. Two rules sort it out, in this order.
+
+DEFAULT_EXTRA_TOKENS = ["sample", "trailer", "proof"]
+DEFAULT_EXTRA_DIRS = [
+    "sample",
+    "samples",
+    "trailer",
+    "trailers",
+    "proof",
+    "extra",
+    "extras",
+    "featurette",
+    "featurettes",
+    "bonus",
+    "behind the scenes",
+]
+DEFAULT_PRIMARY_RATIO = 4.0
+
+
+def is_extra_media(relative_path, config=None):
+    """(True, reason) for a sample/trailer/proof file, else (False, None).
+
+    Pure: this reads the path, never the disk. The token has to sit at the END
+    of the filename stem, or be a directory name, so a real film called
+    "Sample People (2000)" is never mistaken for a preview.
+    """
+    organize_cfg = (config or {}).get("organize", {}) or {}
+    tokens = [str(t).lower() for t in organize_cfg.get("extra_tokens", DEFAULT_EXTRA_TOKENS)]
+    directories = [str(d).lower() for d in organize_cfg.get("extra_dirs", DEFAULT_EXTRA_DIRS)]
+
+    parts = str(relative_path).replace("\\", "/").split("/")
+    stem = os.path.splitext(parts[-1])[0].lower()
+
+    for folder in parts[:-1]:
+        if folder.strip().lower() in directories:
+            return True, f"in a '{folder}' folder, not the feature"
+
+    for token in tokens:
+        # Either the whole name, or the tail after a '.', '-' or '_'.
+        if stem == token or re.search(rf"[.\-_ ]{re.escape(token)}$", stem):
+            return True, f"{token} file, not the feature"
+
+    return False, None
+
+
+def pick_primary_movie(entries, size_of, ratio=DEFAULT_PRIMARY_RATIO):
+    """Which of a folder's movie files is the film. Pure: size_of is injected.
+
+    `entries` is a list of (path, media_type). Returns (winner, losers) where
+    losers is a list of (path, reason). Returns (None, []) — do nothing — when
+    the folder is not unambiguously one movie plus leftovers:
+
+    * a single entry needs no choosing;
+    * a group holding any episode is a season, and every episode must survive;
+    * a winner that is not clearly larger than the runner-up is not a film
+      beside its sample, it is two files worth reporting.
+    """
+    if len(entries) < 2:
+        return None, []
+    if any(media_type != "movie" for _, media_type in entries):
+        return None, []
+
+    # Size first, then path: repeat runs must agree.
+    ranked = sorted(entries, key=lambda e: (-size_of(e[0]), e[0]))
+    winner = ranked[0][0]
+    runner_up = ranked[1][0]
+
+    winner_size = size_of(winner)
+    runner_up_size = size_of(runner_up)
+    if runner_up_size <= 0 or winner_size < runner_up_size * ratio:
+        return None, []
+
+    losers = [
+        (
+            path,
+            f"not the movie in this folder ({human_size(size_of(path))} "
+            f"beside {human_size(winner_size)})",
+        )
+        for path, _ in ranked[1:]
+    ]
+    return winner, losers
 
 
 def group_for(original_path, cwd):
@@ -919,10 +1534,19 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
     Returns (failed paths -> reason, confirmed) where confirmed is False if the
     user declined, so the caller can stop before renaming anything.
     """
+    own_extras = []
     if paths is None:
-        paths = collect_media(cwd, (".mkv", ".mp4", ".avi"))
+        # Run on its own, so nothing has filtered the samples out yet.
+        paths = []
+        for path in collect_media(cwd, (".mkv", ".mp4", ".avi")):
+            is_extra, reason = is_extra_media(os.path.relpath(path, cwd), config)
+            if is_extra:
+                own_extras.append((os.path.relpath(path, cwd), reason))
+            else:
+                paths.append(path)
 
     actionable, untouched = build_audio_plans(paths, config, cwd)
+    untouched = own_extras + untouched
 
     for path, plan, _ in actionable:
         render_audio_plan(os.path.relpath(path, cwd), plan)
@@ -934,9 +1558,14 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
             click.secho(f"  {relative}: {reason}", dim=True)
         click.echo()
 
+    # What the {audio} part of the new name will say once these plans have run.
+    # Probing the file would describe the tracks we are about to drop, so a
+    # dry-run preview would show a name the live run never produces.
+    predicted = {path: audio_tag_from_plan(plan, config) for path, plan, _ in actionable}
+
     if not actionable:
         click.secho("No audio changes to make.", fg="green")
-        return {}, True
+        return {}, True, {}
 
     remuxes = [p for _, p, _ in actionable if p["action"] == "remux"]
     freed = sum(p.get("freed") or 0 for p in remuxes)
@@ -949,7 +1578,10 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
 
     if dry_run:
         click.secho("Dry run, nothing changed.", fg="yellow")
-        return {}, False
+        # Nothing was executed, but nothing was declined either: `organize
+        # --audio --dry-run` still has a rename plan to show, and it is the
+        # only way to preview both halves of the run together.
+        return {}, True, predicted
 
     if not assume_yes:
         click.secho(
@@ -957,7 +1589,7 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
         )
         if not click.confirm("Proceed?", default=False):
             click.secho("Aborted, nothing changed.", fg="yellow")
-            return {}, False
+            return {}, False, {}
 
     click.echo("-" * 40)
     failed = run_audio_phase(actionable, cwd)
@@ -966,7 +1598,9 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
         f"Audio complete. {len(actionable) - len(failed)} changed, {len(failed)} failed.",
         fg="green" if not failed else "yellow",
     )
-    return failed, True
+    # The files that did change are on disk now, so the rename pass can probe
+    # them for the truth; only a preview needs the prediction.
+    return failed, True, {}
 
 
 @click.group()
@@ -1016,12 +1650,26 @@ def audio(dry_run, assume_yes):
 )
 @click.option("--audio", "do_audio", is_flag=True, help="Clean up audio tracks first.")
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip the audio confirmation prompt.")
-def organize(dry_run, ask, partial, do_audio, assume_yes):
+@click.option(
+    "--no-lookup",
+    "no_lookup",
+    is_flag=True,
+    help="Do not ask TMDB for the international title; use the name as parsed.",
+)
+@click.option(
+    "--no-cache", "no_cache", is_flag=True, help="Ignore the stored TMDB lookups."
+)
+def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
     """Organize media files in the current directory."""
     cwd = os.getcwd()
     config = load_config()
+    apply_naming_config(config)
     history = load_state()
     valid_exts = (".mkv", ".mp4", ".avi")
+
+    lookup = not no_lookup and config.get("lookup", {}).get("enabled", True)
+    lookup_cache = {} if no_cache else load_lookup_cache(config)
+    cache_before = len(lookup_cache)
 
     click.echo(f"Running Maatr in {'DRY-RUN mode' if dry_run else 'LIVE mode'}...")
     click.echo("-" * 40)
@@ -1031,16 +1679,41 @@ def organize(dry_run, ask, partial, do_audio, assume_yes):
     # our own output again.
     candidates = collect_media(cwd, valid_exts)
 
+    # Samples and trailers are not worth a remux or a lookup. They are found by
+    # name here; the structural rule (one movie file per movie folder) runs
+    # later, once every target name is known.
+    extras = {}
+    for path in candidates:
+        is_extra, reason = is_extra_media(os.path.relpath(path, cwd), config)
+        if is_extra:
+            extras[path] = reason
+
+    # A folder holding nothing but extras has no feature to organize. Naming a
+    # 64MB preview after the film would put a stub in the library.
+    by_group = {}
+    for path in candidates:
+        by_group.setdefault(group_for(path, cwd)[0], []).append(path)
+    for group_paths in by_group.values():
+        if all(path in extras for path in group_paths):
+            for path in group_paths:
+                extras[path] = "only sample/extra files in this folder"
+
+    feature_candidates = [path for path in candidates if path not in extras]
+
     # Audio first: dropping tracks changes the {audio} part of the new name, so
     # the rename has to see the cleaned file, not the original.
     audio_failed = {}
+    predicted_audio = {}
     if do_audio:
-        audio_failed, confirmed = audio_pass(cwd, config, dry_run, assume_yes, candidates)
+        audio_failed, confirmed, predicted_audio = audio_pass(
+            cwd, config, dry_run, assume_yes, feature_candidates
+        )
         if not confirmed:
             return
         click.echo("-" * 40)
 
     planned = {}  # group key -> list of (original_path, new_path, relative_new_path)
+    resolved = {}  # group key -> the same, plus media_type, before names are claimed
     labels = {}  # group key -> display name
     claimed = {}  # new_path -> original_path, to catch collisions within this run
     failed = {}  # group key -> (offending file, reason)
@@ -1059,6 +1732,12 @@ def organize(dry_run, ask, partial, do_audio, assume_yes):
         relative_source = os.path.relpath(original_path, cwd)
         key, label = group_for(original_path, cwd)
         labels.setdefault(key, label)
+
+        # Named extras go before anything expensive: a sample should not cost a
+        # TMDB lookup, and it must not condemn its folder.
+        if original_path in extras:
+            note_skip(original_path, extras[original_path], breaks_group=False)
+            continue
 
         # Its audio is not what the approved plan said, so its name would not be
         # either. Leave it alone entirely rather than move it under a wrong name.
@@ -1096,9 +1775,13 @@ def organize(dry_run, ask, partial, do_audio, assume_yes):
 
         # Abbreviated filenames often omit the title and year that the
         # container metadata and the folder name still carry.
-        guess, notes = enrich_guess(guess, original_path, media_type)
-        for note in notes:
-            click.secho(f"  {relative_source}: {note}", dim=True)
+        guess, notes = enrich_guess(
+            guess, original_path, media_type, config, lookup, lookup_cache
+        )
+        for note, colour in notes:
+            click.secho(
+                f"  {relative_source}: {note}", fg=colour, dim=colour is None
+            )
 
         missing = missing_fields(guess, media_type)
         if missing:
@@ -1119,7 +1802,12 @@ def organize(dry_run, ask, partial, do_audio, assume_yes):
                 continue
 
         relative_new_path = process_media(
-            guess, original_path, config, media_type, overrides
+            guess,
+            original_path,
+            config,
+            media_type,
+            overrides,
+            predicted_audio.get(original_path),
         )
         new_path = os.path.normpath(os.path.join(cwd, relative_new_path))
 
@@ -1133,19 +1821,60 @@ def organize(dry_run, ask, partial, do_audio, assume_yes):
             note_skip(original_path, "already in place", breaks_group=False)
             continue
 
-        if new_path in claimed:
-            note_skip(
-                original_path,
-                f"would overwrite {os.path.relpath(claimed[new_path], cwd)}",
+        resolved.setdefault(key, []).append(
+            (original_path, new_path, relative_new_path, media_type)
+        )
+
+    # Pass B: one movie per movie folder. This needs every target in a group
+    # before it can choose, and it must not depend on the order files were
+    # walked in -- a sample in a 'Sample/' subfolder sorts before the feature.
+    organize_cfg = config.get("organize", {}) or {}
+    if organize_cfg.get("primary_by_size", True):
+        ratio = float(organize_cfg.get("primary_size_ratio", DEFAULT_PRIMARY_RATIO))
+
+        def size_of(path):
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                return 0
+
+        for key, entries in list(resolved.items()):
+            winner, losers = pick_primary_movie(
+                [(path, media_type) for path, _, _, media_type in entries],
+                size_of,
+                ratio,
             )
-            continue
+            if not losers:
+                continue
+            dropped = {path for path, _ in losers}
+            for path, reason in losers:
+                note_skip(path, reason, breaks_group=False)
+            resolved[key] = [e for e in entries if e[0] not in dropped]
 
-        if os.path.exists(new_path):
-            note_skip(original_path, f"target already exists: {relative_new_path}")
-            continue
+    # Pass C: claim the target names. Anything colliding this late is a real
+    # ambiguity, so it still fails its folder.
+    for key, entries in resolved.items():
+        for original_path, new_path, relative_new_path, _ in entries:
+            if new_path in claimed:
+                note_skip(
+                    original_path,
+                    f"would overwrite {os.path.relpath(claimed[new_path], cwd)}",
+                )
+                continue
 
-        claimed[new_path] = original_path
-        planned.setdefault(key, []).append((original_path, new_path, relative_new_path))
+            if os.path.exists(new_path):
+                note_skip(original_path, f"target already exists: {relative_new_path}")
+                continue
+
+            claimed[new_path] = original_path
+            planned.setdefault(key, []).append(
+                (original_path, new_path, relative_new_path)
+            )
+
+    # Planning is over, so every lookup that was going to happen has happened.
+    # Saving now means a --dry-run warms the cache for the live run.
+    if lookup and not no_cache and len(lookup_cache) != cache_before:
+        save_lookup_cache(config, lookup_cache)
 
     # A folder is organized as a whole or not at all: an unreadable episode in
     # the middle of a season would otherwise leave that season half-renamed.

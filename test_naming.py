@@ -64,6 +64,110 @@ check("colon becomes ' -'", maatr.sanitize_component("Example Movie: The Subtitl
 check("separators stripped", maatr.sanitize_component("../etc/passwd"), "etc passwd")
 check("illegal chars stripped", maatr.sanitize_component('Who? What* "X"'), "Who What X")
 
+print("== names survive the trip to the NAS (ASCII only) ==")
+for raw, want in [
+    # German first: 'Ae', not 'A'
+    ("Ödipussi", "Oedipussi"),
+    ("Über Alles", "Ueber Alles"),
+    ("Die Straße", "Die Strasse"),
+    # macOS hands out decomposed umlauts; they must land on the same name
+    ("München", "Muenchen"),
+    ("München", "Muenchen"),
+    # everything else loses its accents rather than its letters
+    ("Amélie", "Amelie"),
+    ("WALL·E", "WALL-E"),
+    ("Pokémon", "Pokemon"),
+    ("Léon: Der Profi", "Leon - Der Profi"),
+    # colon, with and without the space
+    ("Solo: A Star Wars Story", "Solo - A Star Wars Story"),
+    ("Halo 2:Anniversary", "Halo 2 - Anniversary"),
+    # punctuation that is legal but awkward
+    ("Mike's Dream", "Mikes Dream"),
+    ("Mamma Mia!", "Mamma Mia"),
+    ("Wer ist Hanna?", "Wer ist Hanna"),
+    ("Fire & Ice", "Fire and Ice"),
+    ("Fire&Ice", "Fire and Ice"),
+    # a title that already has a dash must not end up with two
+    ("Spider-Man: No Way Home", "Spider-Man - No Way Home"),
+    ("Alien - : Romulus", "Alien - Romulus"),
+    # a backslash is a separator the moment the drive is read from Windows
+    ("Foo\\Bar", "Foo Bar"),
+    # control characters, and a name that is nothing but banned characters
+    ("Tab\there", "Tab here"),
+    ("...", ""),
+    ("'?!", ""),
+]:
+    check(f"{raw[:30]!r:34}", maatr.sanitize_component(raw), want)
+
+check(
+    "long names capped to 255 bytes",
+    len(maatr.cap_component(("Very Long Title " * 30) + ".mkv").encode("utf-8")) <= 255,
+    True,
+)
+check(
+    "cap keeps the extension",
+    maatr.cap_component(("Very Long Title " * 30) + ".mkv").endswith(".mkv"),
+    True,
+)
+
+print("== samples and extras are told apart from the feature ==")
+for path, want in [
+    # scene releases put the token at the end of the stem, or in a folder
+    ("Movie.2000.1080p-GRP/movie.2000.1080p-grp.sample.mkv", True),
+    ("Movie.2000.1080p-GRP/movie-sample.mkv", True),
+    ("Movie.2000.1080p-GRP/movie_sample.mkv", True),
+    ("Movie.2000.1080p-GRP/sample.mkv", True),
+    ("Movie.2000.1080p-GRP/Sample/anything.mkv", True),
+    ("Movie.2000.1080p-GRP/Extras/deleted-scene.mkv", True),
+    ("Movie.2000.1080p-GRP/movie-trailer.mkv", True),
+    ("Movie.2000.1080p-GRP/movie.proof.mkv", True),
+    # the token has to be at the END, or a real film loses its name
+    ("Sample People (2000)/Sample People (2000).mkv", False),
+    ("Trailer Park Boys/Trailer Park Boys S01E01.mkv", False),
+    ("Movie.2000.1080p-GRP/sampler.mkv", False),
+    ("Movie.2000.1080p-GRP/movie.2000.1080p-grp.mkv", False),
+]:
+    got, _ = maatr.is_extra_media(path)
+    check(f"{path[-40:]:42}", got, want)
+
+print("== one movie per movie folder, but only when it is unambiguous ==")
+SIZES = {"feature.mkv": 10_000_000_000, "sample.mkv": 64_000_000,
+         "part-a.mkv": 5_200_000_000, "part-b.mkv": 4_800_000_000,
+         "ep1.mkv": 2_000_000_000, "ep2.mkv": 2_000_000_000}
+for name, entries, want_winner, want_dropped in [
+    ("film beside its sample: largest wins",
+     [("feature.mkv", "movie"), ("sample.mkv", "movie")], "feature.mkv", 1),
+    ("two near-equal films: refuse, let the folder fail",
+     [("part-a.mkv", "movie"), ("part-b.mkv", "movie")], None, 0),
+    ("a season is never reduced to one episode",
+     [("ep1.mkv", "episode"), ("ep2.mkv", "episode")], None, 0),
+    ("a mixed group is too odd to judge",
+     [("feature.mkv", "movie"), ("ep1.mkv", "episode")], None, 0),
+    ("a single file needs no choosing",
+     [("feature.mkv", "movie")], None, 0),
+]:
+    winner, losers = maatr.pick_primary_movie(entries, SIZES.get)
+    check(f"{name:48}", (winner, len(losers)), (want_winner, want_dropped))
+
+print("== TMDB matches are verified against the year, never guessed ==")
+HITS = [
+    {"id": 1, "title": "Right Film", "release_date": "2018-11-14", "popularity": 9},
+    {"id": 2, "title": "Wrong Film", "release_date": "2011-01-01", "popularity": 99},
+    {"id": 3, "title": "Also Near", "release_date": "2019-06-01", "popularity": 5},
+]
+for name, hits, year, want in [
+    ("exact year wins", HITS, 2018, "Right Film"),
+    ("a year out still counts", HITS, 2020, "Also Near"),
+    ("popularity breaks ties inside the window", HITS, 2010, "Wrong Film"),
+    ("three years out is refused", HITS, 2015, None),
+    ("no year means no verdict", HITS, None, None),
+    ("no results means no verdict", [], 2018, None),
+]:
+    result, reason = maatr.pick_tmdb_movie(hits, year)
+    check(f"{name:42}", result["title"] if result else None, want)
+    check(f"{'  ...with a reason' if want is None else '  ...silently':42}",
+          reason is None, want is not None)
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
