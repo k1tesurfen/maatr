@@ -12,7 +12,7 @@ The installed CLI is `maatr`, aliased `mtr`.
 
 ```bash
 pipx install --force .          # reinstall after changes (pipx is how this is used)
-python test_naming.py           # naming/metadata rules  (80 cases)
+python test_naming.py           # naming/metadata rules  (100 cases)
 python test_audio_rules.py      # audio selection rules  (29 cases)
 ```
 
@@ -28,7 +28,7 @@ Running a single case means commenting out the others; the suites are deliberate
 
 Everything lives in `maatr.py`. Keep it that way unless it grows a lot; if it splits, the natural seams are config, naming, audio, and CLI.
 
-Three commands: `organize` (rename/move), `audio` (track cleanup), `undo` (reverse moves).
+Three commands: `organize` (rename/move, with an interactive review of the names), `audio` (track cleanup), `undo` (reverse moves).
 
 ### The two-phase pattern
 
@@ -39,6 +39,18 @@ Both `organize` and `audio` **plan everything before touching anything**:
 3. Execute.
 
 This is why identification failures cost nothing: the folder is still untouched when the problem is found. Preserve this shape when adding features.
+
+`organize --audio` extends it across both halves: `audio_review` plans and confirms the track cleanup but executes nothing, the rename plan is built on top of the *predicted* `{audio}` tags (`audio_tag_from_plan`), the review list is approved, and only then does `apply_audio` run, followed by the moves. Declining the names must therefore leave the tracks intact too. `audio_pass` is the thin wrapper that keeps the standalone `audio` command's behaviour.
+
+### The review list
+
+`organize` shows every planned name, numbered, and lets each one be corrected before anything is written (`build_review`, `render_review`, `review_names`, `edit_item`). One entry per movie, per season and per unidentified file; numbers are handed out once and never move, so an edit cannot renumber the line the user is about to pick.
+
+An edited line is read back into fields by `parse_name_edit` (a movie filename) or `parse_series_edit` (a series title), both **pure functions**, and the whole target is re-rendered through `process_media` → `format_path` → `sanitize_component`. Never take a typed name as a path: the folder has to follow the corrected title, and a hand-typed title must be sanitized exactly like a parsed one. A typed title counts as verbatim, so `.title()` never re-cases it.
+
+An edit that cannot stand — no title, still-missing fields, a collision with another target or a file on disk — is rejected and the entry is restored from a snapshot; the approved list is always conflict-free. `--yes` prints the list without prompting, `--dry-run` prints it and moves nothing.
+
+Unidentified files are *not* skipped during the resolve pass any more: they become review entries, and only what the user leaves unnamed is reported as a skip. There is no `--ask` flag; naming happens here.
 
 ### Naming: four sources, in order of authority
 
@@ -74,6 +86,7 @@ The rule only fires when **both** configured languages are present; otherwise it
 - **Never invent identifying data.** No default title, season or episode. A file whose title is unknown is reported and left alone. A `"Unknown"` fallback once collapsed an entire series into one file. The same applies to the lookup: no key, no network, or no confident match means the parsed title stands and the file is reported with the reason — never a best guess at which film it is.
 - **Never overwrite.** `move_without_overwrite` reserves the destination with `O_CREAT|O_EXCL` before moving. `shutil.move` silently clobbers on POSIX.
 - **Sanitize every template value, never the template.** `sanitize_component` strips separators and control characters so a parsed title cannot escape the target directory; the template's own `/` are intentional. Targets are also checked with `commonpath`.
+- **One series title per folder.** `unify_series_titles` is a **pure function**: releases that carry the *episode* name in each filename parse as a series per file and scatter one season across a dozen folders. Inside a folder the episodes must agree — the majority title wins, the folder's own parsed name breaks a tie, and a group with neither is left exactly as it was and reported. Never invent the series.
 - **One movie file per movie folder, but only when unambiguous.** `is_extra_media` drops named extras (token at the *end* of the stem, or a `Sample/`-style folder — end-anchoring is what keeps a film called "Sample People" safe). `pick_primary_movie` then keeps the largest file in a group, and is a **pure function** with `size_of` injected so the rule is testable without files. It declines — deliberately — for a group holding any `episode` (a season must stay whole), for a single entry, and when the winner is under `primary_size_ratio` (4×) the runner-up, so two comparable files fail the folder loudly instead of being silently halved. Extras are reported with `breaks_group=False` and left on disk, never moved or deleted.
 - **Target names are claimed after the whole group is known.** `organize` plans in three passes (per-file resolve → per-group primary pick → claim). Claiming inside the per-file loop made the outcome depend on `collect_media`'s lexicographic order: with a `Sample/` subfolder the sample sorts before the feature (`S` < `m`) and the *feature* was the file rejected.
 - **`organize` is all-or-nothing per folder.** Each immediate subdirectory of the working directory succeeds or fails as a unit, so a season is never left half-renamed. `--partial` opts out. `audio` is deliberately per-file instead — a file that fails keeps its original audio, which is untouched rather than half-broken.
@@ -81,7 +94,7 @@ The rule only fires when **both** configured languages are present; otherwise it
 - **Verify duration against the surviving tracks, never the old container.** A Matroska container is as long as its longest track, so dropping the longest one shortens the file legitimately — a German release may carry a Russian dub running 18s past the picture. `expected_duration_ns` computes the length from the tracks that survive the plan, and the video track's own duration is compared before and after as the truncation check. Comparing old container to new rejected correct remuxes.
 - **Persist the undo log after every move**, so an interrupted run stays revertible. Rollback must trim the entries it reverses.
 - **A file whose audio step failed is excluded from renaming**, so everything that moves matches the plan the user approved.
-- **A dry run must preview the name the live run would produce.** `organize --audio --dry-run` has not dropped any tracks yet, so the `{audio}` tag comes from `audio_tag_from_plan` (the plan's surviving tracks) rather than from probing the file. `audio_pass` therefore returns `confirmed=True` on a dry run — it distinguishes "nothing was executed" from "the user declined", and conflating the two once made `--audio --dry-run` stop before the rename plan.
+- **A dry run must preview the name the live run would produce.** `organize --audio --dry-run` has not dropped any tracks yet, so the `{audio}` tag comes from `audio_tag_from_plan` (the plan's surviving tracks) rather than from probing the file. `audio_review` therefore returns `confirmed=True` on a dry run — it distinguishes "nothing was executed" from "the user declined", and conflating the two once made `--audio --dry-run` stop before the rename plan.
 - `mtr undo` reverses moves only. It cannot reverse a remux — the confirmation prompt is the only safety net there.
 
 ## Conventions

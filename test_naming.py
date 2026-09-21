@@ -168,6 +168,79 @@ for name, hits, year, want in [
     check(f"{'  ...with a reason' if want is None else '  ...silently':42}",
           reason is None, want is not None)
 
+print("== one series title per folder ==")
+for name, entries, folder, want_title, want_overrides in [
+    ("a clear majority wins",
+     [("a", "Example Series", "episode"),
+      ("b", "Example Series", "episode"),
+      ("c", "The Long Night", "episode")],
+     None, "Example Series", 1),
+    ("a tie is broken by the folder name",
+     [("a", "The Long Night", "episode"),
+      ("b", "Example Series", "episode")],
+     "Example Series", "Example Series", 1),
+    ("no majority and no folder title changes nothing",
+     [("a", "The Long Night", "episode"),
+      ("b", "Another Night", "episode")],
+     None, None, 0),
+    ("movies are never unified",
+     [("a", "Example Movie", "movie"),
+      ("b", "Other Movie", "movie")],
+     "Example Movie", None, 0),
+    ("a single episode needs no rule",
+     [("a", "The Long Night", "episode")],
+     "Example Series", None, 0),
+    ("already agreeing files are left alone",
+     [("a", "Example Series", "episode"),
+      ("b", "Example Series", "episode")],
+     None, "Example Series", 0),
+]:
+    title, overridden = maatr.unify_series_titles(entries, folder)
+    check(f"{name:48}", (title, len(overridden)), (want_title, want_overrides))
+
+print("== an edited name is read back into fields ==")
+for name, text, want in [
+    ("a full movie name",
+     "Example Movie (2024) [1080p] [ENG-GER].mkv",
+     ("Example Movie", 2024, "1080p", "ENG-GER", "movie")),
+    ("no year is accepted",
+     "Example Movie [1080p] [ENG].mkv",
+     ("Example Movie", None, "1080p", "ENG", "movie")),
+    ("no resolution is accepted",
+     "Example Movie (2024).mkv",
+     ("Example Movie", 2024, None, None, "movie")),
+    ("no extension is fine",
+     "Example Movie (2024) [1080p] [ENG-GER]",
+     ("Example Movie", 2024, "1080p", "ENG-GER", "movie")),
+    ("an episode name keeps its numbers",
+     "Example Series S01E04 [1080p] [ENG-GER].mkv",
+     ("Example Series", None, "1080p", "ENG-GER", "episode")),
+    ("a codec tag is not our audio tag",
+     "Example Movie (2024) [1080p] [x264].mkv",
+     ("Example Movie", 2024, "1080p", None, "movie")),
+]:
+    fields, _ = maatr.parse_name_edit(text)
+    got = (fields.get("title"), fields.get("year"),
+           str(fields["screen_size"]) if fields.get("screen_size") else None,
+           fields.get("audio"), fields.get("_media_type"))
+    check(f"{name:48}", got, want)
+
+fields, warnings = maatr.parse_name_edit("[1080p] [ENG].mkv")
+check("an empty title is refused, never invented", "title" in fields, False)
+check("  ...and says why", bool(warnings), True)
+_, warnings = maatr.parse_name_edit("Example Movie [1080p].mkv")
+check("a missing year is a warning, not a refusal", warnings, ["no year in that name"])
+
+print("== a series line is read back into title and year ==")
+for text, want in [
+    ("Example Series (2019)", ("Example Series", 2019)),
+    ("Example Series", ("Example Series", None)),
+    ("Example Series 2019", ("Example Series", 2019)),
+    ("Example 1899", ("Example 1899", None)),
+    ("", (None, None)),
+]:
+    check(f"{text!r:48}", maatr.parse_series_edit(text), want)
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

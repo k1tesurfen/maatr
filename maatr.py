@@ -2,6 +2,7 @@ import os
 import json
 import re
 import shutil
+import sys
 import subprocess
 import tomllib
 import unicodedata
@@ -1288,16 +1289,19 @@ def process_media(guess, filepath, config, media_type, overrides=None, audio_tag
 
     # A title from TMDB (or typed in by the user) is already correctly cased;
     # .title() would turn "WALL-E" into "Wall-E" and "McDonald" into "Mcdonald".
-    verbatim = guess.get("_title_verbatim") and "title" not in overrides
+    verbatim = bool(guess.get("_title_verbatim")) or "title" in overrides
+
+    year = field("year")
+    resolution = field("screen_size")
 
     data = {
         "title": str(title) if verbatim else str(title).title(),
-        "year": guess.get("year", ""),
+        "year": year if year is not None else "",
         "season": season if season is not None else "",
         "episode": episode if episode is not None else "",
         "season_pad": str(season).zfill(2) if season is not None else "",
         "episode_pad": str(episode).zfill(2) if episode is not None else "",
-        "resolution": guess.get("screen_size", ""),
+        "resolution": resolution if resolution is not None else "",
         "audio": audio_tag or get_audio_languages(filepath, config),
         "ext": os.path.splitext(filepath)[1],
     }
@@ -1334,21 +1338,132 @@ def move_without_overwrite(src, dst):
     return True
 
 
-def prompt_for_fields(filename, media_type, missing):
-    """Asks the user for the fields guessit could not determine."""
-    overrides = {}
-    for f in missing:
-        if f == "title":
-            answer = click.prompt(f"  Title for '{filename}'", type=str, default="").strip()
-            if not answer:
-                return None
-            overrides["title"] = answer
-        else:
-            answer = click.prompt(f"  {f.capitalize()} number", type=int, default=-1)
-            if answer < 0:
-                return None
-            overrides[f] = answer
-    return overrides
+# --- Reading a hand-typed name back into fields --------------------------
+#
+# The review list shows each file under the name it would get, and lets that
+# line be edited. What comes back has to become fields again, so the folder is
+# re-rendered from the corrected title instead of drifting away from it.
+
+# The [ENG-GER] part of a name. guessit does not know this tag is ours, so it
+# is lifted out before the line is parsed and put back verbatim. Only a bracket
+# whose parts are all language codes counts: "[x264]" and "[DTS]" are not ours.
+AUDIO_TAG_RE = re.compile(r"\[((?:[A-Za-z]{2,4})(?:[-+][A-Za-z]{2,4})*)\]")
+AUDIO_TAG_CODES = {code.upper() for code in LANG_ALIASES} | {
+    code.upper() for code in LANG_ALIASES.values()
+} | {"UND"}
+TRAILING_YEAR_RE = re.compile(r"[\s(\[]*(\d{4})[)\]\s]*$")
+
+
+def parse_name_edit(text, media_type=None, audio_codes=None):
+    """Turns an edited filename back into naming fields.
+
+    Pure, so the rule is testable without files. Returns (fields, warnings):
+    `fields` uses guessit's own keys, plus "audio" for our tag and
+    "_media_type" for what the line looks like. An empty title is left out
+    entirely -- the caller refuses the edit rather than inventing one.
+    """
+    warnings = []
+    line = str(text).strip()
+    stem, ext = os.path.splitext(line)
+    if ext.lower() not in (".mkv", ".mp4", ".avi"):
+        # A name typed without its extension is fine; keep the whole thing.
+        stem, ext = line, ""
+
+    audio = None
+    known = {str(code).upper() for code in (audio_codes or AUDIO_TAG_CODES)}
+    for match in AUDIO_TAG_RE.finditer(stem):
+        parts = re.split(r"[-+]", match.group(1))
+        if all(part.upper() in known for part in parts):
+            audio = "-".join(part.upper() for part in parts)
+            stem = stem.replace(match.group(0), " ")
+            break
+
+    guess = guessit(stem)
+    fields = {
+        "title": (str(guess["title"]).strip() if guess.get("title") else None),
+        "year": guess.get("year"),
+        "season": guess.get("season"),
+        "episode": guess.get("episode"),
+        "screen_size": guess.get("screen_size"),
+        "audio": audio,
+    }
+    for key in ("season", "episode"):
+        if isinstance(fields[key], list) and fields[key]:
+            fields[key] = fields[key][0]
+
+    fields["_media_type"] = (
+        "episode"
+        if fields["season"] is not None and fields["episode"] is not None
+        else "movie"
+    )
+
+    if not fields["title"]:
+        warnings.append("no title in that name")
+        fields.pop("title")
+        return fields, warnings
+
+    if fields["year"] is None:
+        warnings.append("no year in that name")
+    if fields["screen_size"] is None:
+        warnings.append("no resolution in that name")
+    if media_type == "episode" and fields["_media_type"] != "episode":
+        warnings.append("no season/episode in that name")
+
+    return fields, warnings
+
+
+def parse_series_edit(text):
+    """Reads 'Example Series (2019)' into (title, year). Pure."""
+    line = str(text).strip()
+    year = None
+    match = TRAILING_YEAR_RE.search(line)
+    if match and MIN_YEAR <= int(match.group(1)) <= MAX_YEAR:
+        year = int(match.group(1))
+        line = line[: match.start()].strip()
+    line = line.strip(" -")
+    return (line or None), year
+
+
+def unify_series_titles(entries, folder_title=None):
+    """One series title per folder. Pure.
+
+    `entries` is [(path, title, media_type)] for one group. Some releases put
+    the EPISODE name in the filename, so each file parses as a series of its
+    own and the season scatters across folders. Within a folder the episodes
+    must agree: the title most of them carry wins, a tie is broken by the
+    folder's own name, and a group with no majority and no usable folder title
+    is left exactly as it was -- reported, never guessed.
+
+    Returns (chosen_title, {path: previous title}) for the files it overrode.
+    """
+    episodes = [(path, title) for path, title, kind in entries if kind == "episode"]
+    if len(episodes) < 2:
+        return None, {}
+
+    counts = {}
+    for _, title in episodes:
+        if title:
+            counts[str(title)] = counts.get(str(title), 0) + 1
+    if not counts:
+        return None, {}
+
+    best = max(counts.values())
+    leaders = sorted(title for title, count in counts.items() if count == best)
+    if len(leaders) == 1:
+        chosen = leaders[0]
+    elif folder_title and str(folder_title) in leaders:
+        chosen = str(folder_title)
+    elif folder_title:
+        chosen = str(folder_title)
+    else:
+        # No majority and nothing to break the tie with: changing anything here
+        # would be a guess at which of them is the series.
+        return None, {}
+
+    overridden = {
+        path: str(title) for path, title in episodes if str(title) != chosen
+    }
+    return chosen, overridden
 
 
 # --- Telling the film from the things shipped next to it -----------------
@@ -1436,6 +1551,314 @@ def pick_primary_movie(entries, size_of, ratio=DEFAULT_PRIMARY_RATIO):
         for path, _ in ranked[1:]
     ]
     return winner, losers
+
+
+# --- The review list -----------------------------------------------------
+#
+# Every name is shown, numbered, before anything is written. A number picks a
+# line to correct by hand; the corrected line is read back into fields and the
+# whole target -- folder included -- is rendered again, so a hand-typed title
+# can never leave the folder saying something else. A season is one entry: the
+# series title belongs to the folder, not to any one episode.
+
+MAX_GROUP_PREVIEW = 4
+
+
+def recompute_entry(entry, config):
+    """Re-renders one file's target from its (possibly edited) fields."""
+    entry["relative_new"] = process_media(
+        entry["guess"],
+        entry["path"],
+        config,
+        entry["media_type"],
+        entry["overrides"],
+        entry["audio_tag"],
+    )
+    entry["target"] = os.path.normpath(os.path.join(entry["cwd"], entry["relative_new"]))
+    return entry
+
+
+def entry_field(entry, name):
+    """The value in force for a field: the user's edit wins over the guess."""
+    if name in entry["overrides"]:
+        return entry["overrides"][name]
+    return entry["guess"].get(name)
+
+
+def target_conflict(entries, claimed, cwd):
+    """Why these targets cannot be used, or None. Checked before an edit sticks."""
+    own = {e["path"] for e in entries}
+    seen = {}
+    for entry in entries:
+        target = entry.get("target")
+        if not target:
+            continue
+        if os.path.commonpath([cwd, target]) != cwd:
+            return f"{entry['relative_new']} would land outside this directory"
+        if target in seen:
+            return f"two files would both become {os.path.relpath(target, cwd)}"
+        seen[target] = entry["path"]
+        owner = claimed.get(target)
+        if owner and owner not in own:
+            return (
+                f"{os.path.relpath(target, cwd)} is already taken by "
+                f"{os.path.relpath(owner, cwd)}"
+            )
+        if os.path.exists(target) and target not in own:
+            return f"{os.path.relpath(target, cwd)} already exists"
+    return None
+
+
+def claim_targets(entries, claimed):
+    """Records these targets, dropping whatever these files claimed before."""
+    own = {e["path"] for e in entries}
+    for target in [t for t, path in claimed.items() if path in own]:
+        del claimed[target]
+    for entry in entries:
+        if entry.get("target"):
+            claimed[entry["target"]] = entry["path"]
+
+
+def build_review(plan_entries, unknown_entries):
+    """The numbered model: one item per movie, per season, per unknown file."""
+    items = []
+    groups = {}
+    for entry in plan_entries:
+        if entry["media_type"] == "episode":
+            item = groups.get(entry["key"])
+            if item is None:
+                item = {"kind": "group", "key": entry["key"], "entries": []}
+                groups[entry["key"]] = item
+                items.append(item)
+            item["entries"].append(entry)
+        else:
+            items.append({"kind": "movie", "key": entry["key"], "entries": [entry]})
+    for entry in unknown_entries:
+        items.append({"kind": "unknown", "key": entry["key"], "entries": [entry]})
+
+    # Numbers are handed out once and never move: an edit must not renumber the
+    # line the user is about to pick next.
+    for number, item in enumerate(items, 1):
+        item["num"] = number
+    return items
+
+
+def item_line(item):
+    """The text put in front of the cursor when this item is edited."""
+    entry = item["entries"][0]
+    if item["kind"] == "group":
+        title = entry_field(entry, "title") or ""
+        year = entry_field(entry, "year")
+        return f"{title} ({year})" if year else str(title)
+    if entry.get("relative_new"):
+        return os.path.basename(entry["relative_new"])
+    return os.path.basename(entry["path"])
+
+
+def render_review(items, cwd):
+    """Prints the numbered plan."""
+    click.secho("Planned names:", bold=True)
+    for item in items:
+        number = f"[{item['num']}]"
+        edited = "  (edited)" if item.get("edited") else ""
+        entries = item["entries"]
+
+        if item["kind"] == "group":
+            title = item_line(item)
+            click.secho(
+                f"{number} {title}  ({len(entries)} episode(s)){edited}", bold=True
+            )
+            for entry in entries[:MAX_GROUP_PREVIEW]:
+                click.secho(f"      {entry['relative_new']}", fg="green")
+            if len(entries) > MAX_GROUP_PREVIEW:
+                click.secho(
+                    f"      ... {len(entries) - MAX_GROUP_PREVIEW} more", dim=True
+                )
+        elif item["kind"] == "unknown" and not entries[0].get("relative_new"):
+            entry = entries[0]
+            click.secho(
+                f"{number} ???  {os.path.relpath(entry['path'], cwd)}", fg="yellow"
+            )
+            click.secho(
+                f"      {entry['reason']} (pick {item['num']} to name it)", fg="yellow"
+            )
+        else:
+            entry = entries[0]
+            click.secho(f"{number} {os.path.relpath(entry['path'], cwd)}", dim=True)
+            click.secho(f"      -> {entry['relative_new']}{edited}", fg="green")
+
+        for note in item.get("notes", []):
+            click.secho(f"      {note}", fg="yellow")
+
+    movies = sum(1 for i in items if i["kind"] == "movie")
+    seasons = sum(1 for i in items if i["kind"] == "group")
+    unknown = sum(
+        1 for i in items if i["kind"] == "unknown" and not i["entries"][0].get("relative_new")
+    )
+    click.echo("-" * 40)
+    click.echo(
+        f"{len(items)} item(s): {movies} movie(s), {seasons} season(s), "
+        f"{unknown} unidentified."
+    )
+
+
+def editable_readline():
+    """A readline that can put text in front of the cursor, or None.
+
+    macOS ships libedit behind the stdlib `readline`, and libedit ignores the
+    startup hook: the name would come up as an empty prompt and have to be
+    retyped in full. gnureadline is the real thing, so it is preferred, and
+    everything falls back to a plain prompt with a default.
+    """
+    for name in ("gnureadline", "readline"):
+        try:
+            module = __import__(name)
+        except ImportError:
+            continue
+        if getattr(module, "backend", "readline") == "editline":
+            continue
+        if hasattr(module, "set_startup_hook") and hasattr(module, "insert_text"):
+            return module
+    return None
+
+
+def prompt_line(label, current):
+    """Asks for a line with `current` already typed in, ready to be edited."""
+    readline = editable_readline()
+
+    if readline is not None and sys.stdin.isatty():
+        def hook():
+            readline.insert_text(current)
+            readline.redisplay()
+
+        readline.set_startup_hook(hook)
+        try:
+            return input(label)
+        except EOFError:
+            return ""
+        finally:
+            readline.set_startup_hook()
+
+    # No line editing available: show the name and let Enter keep it.
+    click.secho(f"  current: {current}", dim=True)
+    return click.prompt(label.rstrip(), default=current, show_default=False)
+
+
+def edit_item(item, claimed, config, cwd):
+    """Renames one item in place. Leaves it untouched if the edit cannot stand."""
+    entries = item["entries"]
+    is_group = item["kind"] == "group"
+    label = f"Series name [{item['num']}]: " if is_group else f"New name [{item['num']}]: "
+
+    answer = prompt_line(label, item_line(item)).strip()
+    if not answer:
+        click.secho("  unchanged.", dim=True)
+        return
+
+    if is_group:
+        title, year = parse_series_edit(answer)
+        if not title:
+            click.secho("  !! a series needs a title; nothing changed.", fg="red")
+            return
+        updates = {"title": title}
+        if year is not None:
+            updates["year"] = year
+        warnings = []
+    else:
+        entry = entries[0]
+        fields, warnings = parse_name_edit(
+            answer, entry.get("media_type"), audio_codes_for(config)
+        )
+        if "title" not in fields:
+            click.secho("  !! a name needs a title; nothing changed.", fg="red")
+            return
+        updates = {
+            key: fields[key]
+            for key in ("title", "year", "season", "episode", "screen_size")
+        }
+
+    # Snapshot, so a rejected edit leaves the plan exactly as it was.
+    before = [
+        (
+            dict(e["overrides"]),
+            e["audio_tag"],
+            e["media_type"],
+            e.get("relative_new"),
+            e.get("target"),
+        )
+        for e in entries
+    ]
+
+    for entry in entries:
+        entry["overrides"].update(updates)
+        if not is_group:
+            if fields.get("audio"):
+                entry["audio_tag"] = fields["audio"]
+            if item["kind"] == "unknown" or fields["_media_type"] == "episode":
+                entry["media_type"] = fields["_media_type"]
+        recompute_entry(entry, config)
+
+    missing = missing_fields(
+        entries[0]["guess"], entries[0]["media_type"], entries[0]["overrides"]
+    )
+    problem = None
+    if missing:
+        problem = f"still missing {', '.join(missing)}"
+    else:
+        problem = target_conflict(entries, claimed, cwd)
+
+    if problem:
+        click.secho(f"  !! {problem}; nothing changed.", fg="red")
+        for entry, state in zip(entries, before):
+            (
+                entry["overrides"],
+                entry["audio_tag"],
+                entry["media_type"],
+                entry["relative_new"],
+                entry["target"],
+            ) = (dict(state[0]), state[1], state[2], state[3], state[4])
+        return
+
+    claim_targets(entries, claimed)
+    item["edited"] = True
+    # The notes describe what Maatr worked out; the user has just overruled it.
+    item["notes"] = []
+    for warning in warnings:
+        click.secho(f"  note: {warning}", fg="yellow")
+
+
+def audio_codes_for(config):
+    """Every tag the {audio} part of a name can carry, for reading one back."""
+    mapping = (config.get("audio", {}) or {}).get("mapping", {}) or {}
+    codes = set(AUDIO_TAG_CODES)
+    codes.update(str(value).upper() for value in mapping.values())
+    fallback = (config.get("audio", {}) or {}).get("default_fallback")
+    if fallback:
+        codes.add(str(fallback).upper())
+    return codes
+
+
+def review_names(items, claimed, config, cwd):
+    """Shows the plan and lets it be corrected. True to apply, False to abort."""
+    while True:
+        click.echo("-" * 40)
+        render_review(items, cwd)
+        answer = click.prompt(
+            "Apply these names? [y/N/number]", default="n", show_default=False
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+        if answer.isdigit():
+            chosen = next((i for i in items if i["num"] == int(answer)), None)
+            if chosen is None:
+                click.secho(f"  !! no item {answer}.", fg="yellow")
+                continue
+            edit_item(chosen, claimed, config, cwd)
+            continue
+        click.secho("  !! enter y, n, or an item number.", fg="yellow")
 
 
 def group_for(original_path, cwd):
@@ -1528,11 +1951,16 @@ def run_audio_phase(actionable, cwd):
     return failed
 
 
-def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
-    """Plan, show, confirm, execute. Shared by `audio` and `organize --audio`.
+def audio_review(cwd, config, dry_run, assume_yes, paths=None):
+    """Plan, show, confirm -- but execute nothing.
 
-    Returns (failed paths -> reason, confirmed) where confirmed is False if the
-    user declined, so the caller can stop before renaming anything.
+    Kept separate from the execution so `organize` can get both halves of a run
+    approved before it writes anything: the rename list is built from the
+    predicted tags, and declining it costs no remux.
+
+    Returns (actionable, predicted tags, confirmed). `confirmed` is False only
+    when the user declined; a dry run confirms, because it has a rename plan
+    left to show and nothing was declined.
     """
     own_extras = []
     if paths is None:
@@ -1565,7 +1993,7 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
 
     if not actionable:
         click.secho("No audio changes to make.", fg="green")
-        return {}, True, {}
+        return [], {}, True
 
     remuxes = [p for _, p, _ in actionable if p["action"] == "remux"]
     freed = sum(p.get("freed") or 0 for p in remuxes)
@@ -1581,7 +2009,7 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
         # Nothing was executed, but nothing was declined either: `organize
         # --audio --dry-run` still has a rename plan to show, and it is the
         # only way to preview both halves of the run together.
-        return {}, True, predicted
+        return actionable, predicted, True
 
     if not assume_yes:
         click.secho(
@@ -1589,8 +2017,13 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
         )
         if not click.confirm("Proceed?", default=False):
             click.secho("Aborted, nothing changed.", fg="yellow")
-            return {}, False, {}
+            return [], {}, False
 
+    return actionable, predicted, True
+
+
+def apply_audio(actionable, cwd):
+    """Runs the approved audio plans. Returns the files that failed."""
     click.echo("-" * 40)
     failed = run_audio_phase(actionable, cwd)
     click.echo("-" * 40)
@@ -1598,9 +2031,15 @@ def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
         f"Audio complete. {len(actionable) - len(failed)} changed, {len(failed)} failed.",
         fg="green" if not failed else "yellow",
     )
-    # The files that did change are on disk now, so the rename pass can probe
-    # them for the truth; only a preview needs the prediction.
-    return failed, True, {}
+    return failed
+
+
+def audio_pass(cwd, config, dry_run, assume_yes, paths=None):
+    """Plan, show, confirm, execute. The standalone `audio` command."""
+    actionable, _, confirmed = audio_review(cwd, config, dry_run, assume_yes, paths)
+    if not confirmed or dry_run or not actionable:
+        return {}
+    return apply_audio(actionable, cwd)
 
 
 @click.group()
@@ -1642,14 +2081,18 @@ def audio(dry_run, assume_yes):
 
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Preview changes without moving files.")
-@click.option("--ask", is_flag=True, help="Ask for confirmation on unknown files.")
 @click.option(
     "--partial",
     is_flag=True,
     help="Organize every file that can be identified, instead of skipping its whole folder.",
 )
 @click.option("--audio", "do_audio", is_flag=True, help="Clean up audio tracks first.")
-@click.option("--yes", "assume_yes", is_flag=True, help="Skip the audio confirmation prompt.")
+@click.option(
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    help="Skip both confirmation prompts and apply the plan as it stands.",
+)
 @click.option(
     "--no-lookup",
     "no_lookup",
@@ -1659,7 +2102,7 @@ def audio(dry_run, assume_yes):
 @click.option(
     "--no-cache", "no_cache", is_flag=True, help="Ignore the stored TMDB lookups."
 )
-def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
+def organize(dry_run, partial, do_audio, assume_yes, no_lookup, no_cache):
     """Organize media files in the current directory."""
     cwd = os.getcwd()
     config = load_config()
@@ -1700,20 +2143,23 @@ def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
 
     feature_candidates = [path for path in candidates if path not in extras]
 
-    # Audio first: dropping tracks changes the {audio} part of the new name, so
-    # the rename has to see the cleaned file, not the original.
-    audio_failed = {}
+    # Audio is planned and approved first, but not executed: the whole run --
+    # remux and rename together -- is approved before a single byte is written,
+    # so declining the names costs no tracks. The {audio} part of every new
+    # name therefore comes from the approved plan, not from probing a file that
+    # still carries the tracks that plan drops.
+    audio_actionable = []
     predicted_audio = {}
     if do_audio:
-        audio_failed, confirmed, predicted_audio = audio_pass(
+        audio_actionable, predicted_audio, confirmed = audio_review(
             cwd, config, dry_run, assume_yes, feature_candidates
         )
         if not confirmed:
             return
         click.echo("-" * 40)
 
-    planned = {}  # group key -> list of (original_path, new_path, relative_new_path)
-    resolved = {}  # group key -> the same, plus media_type, before names are claimed
+    resolved = {}  # group key -> entries, before names are claimed
+    unknown = []  # entries the review list can still rescue by name
     labels = {}  # group key -> display name
     claimed = {}  # new_path -> original_path, to catch collisions within this run
     failed = {}  # group key -> (offending file, reason)
@@ -1728,7 +2174,6 @@ def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
             failed[key] = (os.path.relpath(path, cwd), reason)
 
     for original_path in candidates:
-        file = os.path.basename(original_path)
         relative_source = os.path.relpath(original_path, cwd)
         key, label = group_for(original_path, cwd)
         labels.setdefault(key, label)
@@ -1739,45 +2184,36 @@ def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
             note_skip(original_path, extras[original_path], breaks_group=False)
             continue
 
-        # Its audio is not what the approved plan said, so its name would not be
-        # either. Leave it alone entirely rather than move it under a wrong name.
-        if original_path in audio_failed:
-            note_skip(
-                original_path,
-                f"audio step failed ({audio_failed[original_path]})",
-                breaks_group=False,
-            )
-            continue
-
         # Feed the whole relative path to guessit: when the filename itself is
         # cryptic, the folder it sits in often still carries the series name.
         guess = guessit(relative_source)
         media_type = guess.get("type")
-        overrides = {}
 
-        if media_type not in ["movie", "episode"]:
-            if ask:
-                click.secho(f"\n[?] Unknown media: {relative_source}", fg="yellow")
-                choice = click.prompt(
-                    "Is this a [m]ovie, [e]pisode, or [s]kip?", type=str
-                ).lower()
-                if choice == "m":
-                    media_type = "movie"
-                elif choice == "e":
-                    media_type = "episode"
-                else:
-                    # A deliberate choice, so it doesn't condemn the rest.
-                    note_skip(original_path, "skipped by user", breaks_group=False)
-                    continue
-            else:
-                note_skip(original_path, "could not tell movie from episode")
-                continue
+        entry = {
+            "path": original_path,
+            "cwd": cwd,
+            "key": key,
+            "guess": guess,
+            "media_type": media_type,
+            "overrides": {},
+            "audio_tag": predicted_audio.get(original_path),
+            "relative_new": None,
+            "target": None,
+        }
+
+        if media_type not in ("movie", "episode"):
+            # Not skipped yet: the review list offers it for naming, and only a
+            # file left unnamed there counts as one we could not identify.
+            entry["reason"] = "could not tell movie from episode"
+            unknown.append(entry)
+            continue
 
         # Abbreviated filenames often omit the title and year that the
         # container metadata and the folder name still carry.
         guess, notes = enrich_guess(
             guess, original_path, media_type, config, lookup, lookup_cache
         )
+        entry["guess"] = guess
         for note, colour in notes:
             click.secho(
                 f"  {relative_source}: {note}", fg=colour, dim=colour is None
@@ -1785,49 +2221,27 @@ def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
 
         missing = missing_fields(guess, media_type)
         if missing:
-            if ask:
-                click.secho(
-                    f"\n[?] Could not determine {', '.join(missing)} for: {relative_source}",
-                    fg="yellow",
-                )
-                answer = prompt_for_fields(file, media_type, missing)
-                if answer is None:
-                    note_skip(original_path, "skipped by user", breaks_group=False)
-                    continue
-                overrides = answer
-            else:
-                note_skip(
-                    original_path, f"unknown {', '.join(missing)} (use --ask to fill in)"
-                )
-                continue
+            entry["reason"] = f"unknown {', '.join(missing)}"
+            unknown.append(entry)
+            continue
 
-        relative_new_path = process_media(
-            guess,
-            original_path,
-            config,
-            media_type,
-            overrides,
-            predicted_audio.get(original_path),
-        )
-        new_path = os.path.normpath(os.path.join(cwd, relative_new_path))
+        recompute_entry(entry, config)
 
         # A sanitized title can't escape cwd, but verify rather than trust.
-        if os.path.commonpath([cwd, new_path]) != cwd:
+        if os.path.commonpath([cwd, entry["target"]]) != cwd:
             note_skip(original_path, "target would land outside this directory")
             continue
 
-        if new_path == original_path:
+        if entry["target"] == original_path:
             # Nothing to do and nothing wrong: a second run over a tidy folder.
             note_skip(original_path, "already in place", breaks_group=False)
             continue
 
-        resolved.setdefault(key, []).append(
-            (original_path, new_path, relative_new_path, media_type)
-        )
+        resolved.setdefault(key, []).append(entry)
 
-    # Pass B: one movie per movie folder. This needs every target in a group
-    # before it can choose, and it must not depend on the order files were
-    # walked in -- a sample in a 'Sample/' subfolder sorts before the feature.
+    # Pass B: the group-wide rules. Both need every target in a group before
+    # they can choose, and neither may depend on the order files were walked in
+    # -- a sample in a 'Sample/' subfolder sorts before the feature.
     organize_cfg = config.get("organize", {}) or {}
     if organize_cfg.get("primary_by_size", True):
         ratio = float(organize_cfg.get("primary_size_ratio", DEFAULT_PRIMARY_RATIO))
@@ -1840,41 +2254,106 @@ def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
 
         for key, entries in list(resolved.items()):
             winner, losers = pick_primary_movie(
-                [(path, media_type) for path, _, _, media_type in entries],
-                size_of,
-                ratio,
+                [(e["path"], e["media_type"]) for e in entries], size_of, ratio
             )
             if not losers:
                 continue
             dropped = {path for path, _ in losers}
             for path, reason in losers:
                 note_skip(path, reason, breaks_group=False)
-            resolved[key] = [e for e in entries if e[0] not in dropped]
+            resolved[key] = [e for e in entries if e["path"] not in dropped]
+
+    # A release that puts the EPISODE name in each filename parses as a series
+    # per file, which scatters one season across a dozen folders. Inside a
+    # folder the episodes have to agree on the series.
+    series_notes = {}
+    for key, entries in resolved.items():
+        folder_title = None
+        if key[0] == "dir":
+            folder_title = guessit(key[1]).get("title")
+        chosen, overridden = unify_series_titles(
+            [(e["path"], entry_field(e, "title"), e["media_type"]) for e in entries],
+            folder_title,
+        )
+        if not overridden:
+            continue
+        for entry in entries:
+            if entry["path"] in overridden:
+                entry["overrides"]["title"] = chosen
+                recompute_entry(entry, config)
+        series_notes[key] = (
+            f"series title unified to {chosen!r} "
+            f"({len(overridden)} file(s) parsed as something else)"
+        )
 
     # Pass C: claim the target names. Anything colliding this late is a real
     # ambiguity, so it still fails its folder.
+    plan_entries = []
     for key, entries in resolved.items():
-        for original_path, new_path, relative_new_path, _ in entries:
-            if new_path in claimed:
-                note_skip(
-                    original_path,
-                    f"would overwrite {os.path.relpath(claimed[new_path], cwd)}",
-                )
+        for entry in entries:
+            problem = target_conflict([entry], claimed, cwd)
+            if problem:
+                note_skip(entry["path"], problem)
                 continue
-
-            if os.path.exists(new_path):
-                note_skip(original_path, f"target already exists: {relative_new_path}")
-                continue
-
-            claimed[new_path] = original_path
-            planned.setdefault(key, []).append(
-                (original_path, new_path, relative_new_path)
-            )
+            claim_targets([entry], claimed)
+            plan_entries.append(entry)
 
     # Planning is over, so every lookup that was going to happen has happened.
     # Saving now means a --dry-run warms the cache for the live run.
     if lookup and not no_cache and len(lookup_cache) != cache_before:
         save_lookup_cache(config, lookup_cache)
+
+    # The review: every name, numbered, correctable by hand before anything is
+    # written. A dry run shows the same list without the prompt.
+    items = build_review(plan_entries, unknown)
+    for item in items:
+        note = series_notes.get(item["key"])
+        if note:
+            item.setdefault("notes", []).append(note)
+
+    if items:
+        if dry_run or assume_yes:
+            click.echo("-" * 40)
+            render_review(items, cwd)
+        elif not review_names(items, claimed, config, cwd):
+            click.secho("Aborted, nothing changed.", fg="yellow")
+            return
+    elif not skipped:
+        click.secho("Nothing to organize.", fg="green")
+        return
+
+    # Whatever the review did not rescue is a file we could not identify.
+    plan_entries = [e for e in plan_entries if e.get("target")]
+    for entry in unknown:
+        if entry.get("target"):
+            plan_entries.append(entry)
+        else:
+            note_skip(entry["path"], entry["reason"])
+
+    # Approved. Audio goes first: dropping tracks is what the new name says.
+    audio_failed = {}
+    if do_audio and audio_actionable and not dry_run:
+        audio_failed = apply_audio(audio_actionable, cwd)
+
+    # Its audio is not what the approved plan said, so its name would not be
+    # either. Leave it alone entirely rather than move it under a wrong name.
+    if audio_failed:
+        kept = []
+        for entry in plan_entries:
+            reason = audio_failed.get(entry["path"])
+            if reason:
+                note_skip(
+                    entry["path"], f"audio step failed ({reason})", breaks_group=False
+                )
+            else:
+                kept.append(entry)
+        plan_entries = kept
+
+    planned = {}
+    for entry in plan_entries:
+        planned.setdefault(entry["key"], []).append(
+            (entry["path"], entry["target"], entry["relative_new"])
+        )
 
     # A folder is organized as a whole or not at all: an unreadable episode in
     # the middle of a season would otherwise leave that season half-renamed.
@@ -1889,11 +2368,13 @@ def organize(dry_run, ask, partial, do_audio, assume_yes, no_lookup, no_cache):
         group_failed = None
 
         for original_path, new_path, relative_new_path in moves:
+            if dry_run:
+                # The review list above already showed every name; repeating it
+                # here would just print the same plan twice.
+                continue
+
             click.echo(f"Found: {os.path.relpath(original_path, cwd)}")
             click.secho(f"  -> {relative_new_path}\n", fg="green")
-
-            if dry_run:
-                continue
 
             try:
                 reserved = move_without_overwrite(original_path, new_path)

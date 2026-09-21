@@ -9,7 +9,11 @@ description = "Bring order to the chaos of media files."
 requires-python = ">=3.11"  # tomllib
 dependencies = [
     "click",
-    "guessit"
+    "guessit",
+    # The review list puts the current name in front of the cursor to be
+    # edited. macOS' stdlib readline is libedit, which ignores the startup
+    # hook that does it, so the real GNU readline is pulled in there.
+    "gnureadline; sys_platform == 'darwin'",
 ]
 
 [project.scripts]

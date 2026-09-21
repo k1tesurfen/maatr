@@ -47,10 +47,39 @@ maatr organize
 ```
 
 - Use `--dry-run` to see what would happen without moving files.
-- Use `--ask` to fill in the details Maatr could not read from a file (media type, title, season, episode).
 - Use `--partial` to organize every file that can be identified instead of skipping its whole folder.
+- Use `--yes` to apply the plan as it stands, without the review prompt.
 - Use `--no-lookup` to keep the title as parsed instead of asking TMDB for the international one.
 - Use `--no-cache` to ignore stored TMDB lookups and ask again.
+
+#### The review list
+
+Nothing is moved until you have seen every name. Maatr numbers the plan — one entry per movie, one per season, one per file it could not identify — and waits:
+
+```
+Planned names:
+[1] Beispiel.Film.2024.German.DL.1080p-XYZ/beispiel.film.2024.1080p.mkv
+      -> Example Movie (2024)/Example Movie (2024) [1080p] [ENG-GER].mkv
+[2] Example Series  (12 episode(s))
+      Example Series/Example Series Season 1/Example Series S01E01 [1080p] [ENG-GER].mkv
+      ... 8 more
+      series title unified to 'Example Series' (1 file(s) parsed as something else)
+[3] ???  Some.Release.x264.mkv
+      unknown title (pick 3 to name it)
+----------------------------------------
+3 item(s): 1 movie(s), 1 season(s), 1 unidentified.
+Apply these names? [y/N/number]:
+```
+
+- **y** applies the plan.
+- **n** (or Enter) aborts the whole run — with `--audio`, not a single track has been dropped at that point either.
+- **a number** puts that name in front of the cursor to be edited. Type the name you want, hit Enter, and Maatr reads the title, year, resolution and language tag back out of it and re-renders the folder to match. A season asks for the series title instead, and re-renders every episode in it. Then it asks again, so you can correct one entry after another.
+
+An unidentified file is named the same way: give it a name and it joins the plan. A name that would collide with another file is refused on the spot, naming the file that already has it, so the list you finally approve cannot overwrite anything. A name missing its year or resolution is accepted, with a note; a name with no title at all is refused, because a guessed title is what merges a whole series into one file.
+
+#### One series title per folder
+
+Some releases put the *episode* title in each filename, which used to scatter one season across a dozen folders. Within a folder, the episodes now have to agree: the title most of them carry wins, a tie is broken by the folder's own name, and the override is reported in the review list. A folder with no majority and no usable folder name is left alone rather than guessed at.
 
 #### All or nothing per folder
 
@@ -175,6 +204,8 @@ maatr audio              # plan, confirm, then work
 maatr audio --dry-run    # show the plan and exit
 maatr organize --audio   # clean audio first, then rename
 ```
+
+With `organize --audio`, both halves of the run are approved before anything is written: the audio plan first, then the review list of new names — which already shows the `[ENG-GER]` tag the file will carry *after* the remux. Declining the names leaves the tracks alone too.
 
 Nothing is changed until you approve the plan. Maatr prints every audio track of every file, marked KEEP or DROP with its size, and asks once:
 
